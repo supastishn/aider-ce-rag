@@ -194,8 +194,8 @@ class RepoRAG:
             from llama_index.core import Settings
         except Exception as ex:  # pragma: no cover - import-time failures
             raise RuntimeError(
-                "llama_index is required for RepoRAG. Install the help extras:"
-                " pip install 'aider-ce[help]'"
+                "llama_index is required for RepoRAG. Install the rag extras:"
+                " pip install 'aider-ce[rag]'"
             ) from ex
 
         # Enable tokenizer parallelism for HF models, like aider.help
@@ -206,8 +206,8 @@ class RepoRAG:
                 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
             except Exception as ex:  # pragma: no cover
                 raise RuntimeError(
-                    "HuggingFace embeddings unavailable. Install the help extras:"
-                    " pip install 'aider-ce[help]'"
+                    "HuggingFace embeddings unavailable. Install the rag extras:"
+                    " pip install 'aider-ce[rag]'"
                 ) from ex
 
             Settings.embed_model = HuggingFaceEmbedding(
@@ -224,8 +224,8 @@ class RepoRAG:
             from llama_index.core import StorageContext, load_index_from_storage
         except Exception as ex:  # pragma: no cover
             raise RuntimeError(
-                "llama_index is required for RepoRAG. Install the help extras:"
-                " pip install 'aider-ce[help]'"
+                "llama_index is required for RepoRAG. Install the rag extras:"
+                " pip install 'aider-ce[rag]'"
             ) from ex
 
         if not self.persist_dir.exists():
@@ -319,8 +319,8 @@ class RepoRAG:
                 SimpleNodeParser = None  # type: ignore
         except Exception as ex:  # pragma: no cover
             raise RuntimeError(
-                "llama_index is required for RepoRAG. Install the help extras:"
-                " pip install 'aider-ce[help]'"
+                "llama_index is required for RepoRAG. Install the rag extras:"
+                " pip install 'aider-ce[rag]'"
             ) from ex
 
         files = self.scan_files()

@@ -136,6 +136,28 @@ class Commands:
         models.sanity_check_models(self.io, model)
         raise SwitchCoder(main_model=model)
 
+    def cmd_rag_model(self, args):
+        "Set the RAG indexing embedding model"
+
+        model_name = args.strip()
+        if not model_name:
+            current = getattr(getattr(self, "args", None), "rag_model", None)
+            if current:
+                self.io.tool_output(f"Current RAG model: {current}")
+            else:
+                self.io.tool_output(
+                    "No RAG model set. Using default if rag extras installed."
+                )
+            self.io.tool_output(
+                "Tip: persist via config file or env AIDER_RAG_MODEL."
+            )
+            return
+
+        # Update the in-memory args so subsequent /rag init uses it
+        if hasattr(self, "args"):
+            setattr(self.args, "rag_model", model_name)
+        self.io.tool_output(f"RAG model set to: {model_name}")
+
     def cmd_chat_mode(self, args):
         "Switch to a new chat mode"
 
@@ -304,7 +326,7 @@ class Commands:
             self.io.tool_error(str(err))
             if action in {"init", "update"}:
                 self.io.tool_output(
-                    "To enable RAG features, install help extras: pip install 'aider-ce[help]'"
+                    "To enable RAG features, install rag extras: pip install 'aider-ce[rag]'"
                 )
             return
 
