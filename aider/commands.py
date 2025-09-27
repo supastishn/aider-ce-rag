@@ -17,6 +17,7 @@ from aider import models, prompts, voice
 from aider.editor import pipe_editor
 from aider.format_settings import format_settings
 from aider.help import Help, install_help_extra
+from aider.rag import cli_handle_rag
 from aider.io import CommandCompletionException
 from aider.llm import litellm
 from aider.repo import ANY_GIT_ERROR
@@ -283,6 +284,31 @@ class Commands:
             commands.append("/" + cmd)
 
         return commands
+
+    def cmd_rag(self, args):
+        "Initialize/update a repo RAG index: /rag init|update|deinit [path]"
+        parts = args.strip().split()
+        if not parts:
+            self.io.tool_output("Usage: /rag init|update|deinit [path]")
+            return
+
+        action = parts[0]
+        root = parts[1] if len(parts) > 1 else "."
+        try:
+            msg = cli_handle_rag(action, root)
+        except RuntimeError as err:
+            # Likely missing llama_index/embedding extras
+            self.io.tool_error(str(err))
+            if action in {"init", "update"}:
+                self.io.tool_output(
+                    "To enable RAG features, install help extras: pip install 'aider-ce[help]'"
+                )
+            return
+
+        if msg:
+            self.io.tool_output(msg)
+        else:
+            self.io.tool_error("Unknown RAG action or error occurred.")
 
     def do_run(self, cmd_name, args):
         cmd_name = cmd_name.replace("-", "_")
