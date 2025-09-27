@@ -266,6 +266,20 @@ def get_parser(default_config_files, git_root):
         default=False,
         help="Enable caching of prompts (default: False)",
     )
+
+    ##########
+    group = parser.add_argument_group("RAG settings")
+    group.add_argument(
+        "--rag-model",
+        dest="rag_model",
+        metavar="RAG_MODEL",
+        default=None,
+        help=(
+            "Embedding model to use for repository RAG indexing"
+            " (default: BAAI/bge-small-en-v1.5). Can also be set in config as 'rag-model' or"
+            " via env AIDER_RAG_MODEL."
+        ),
+    )
     group.add_argument(
         "--cache-keepalive-pings",
         type=int,

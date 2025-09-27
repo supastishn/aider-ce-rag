@@ -294,8 +294,11 @@ class Commands:
 
         action = parts[0]
         root = parts[1] if len(parts) > 1 else "."
+
+        # Select embedding model from args/config if provided
+        embedding_model = getattr(self.args, "rag_model", None)
         try:
-            msg = cli_handle_rag(action, root)
+            msg = cli_handle_rag(action, root, embedding_model=embedding_model)
         except RuntimeError as err:
             # Likely missing llama_index/embedding extras
             self.io.tool_error(str(err))

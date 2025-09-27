@@ -48,6 +48,9 @@ import pathspec
 from aider import __version__, utils
 
 
+DEFAULT_RAG_MODEL = "BAAI/bge-small-en-v1.5"
+
+
 @dataclass
 class EmbeddingConfig:
     """Configuration for embeddings provider.
@@ -57,7 +60,7 @@ class EmbeddingConfig:
     """
 
     provider: str = "huggingface"
-    model_name: str = "BAAI/bge-small-en-v1.5"
+    model_name: str = DEFAULT_RAG_MODEL
 
 
 class RepoRAG:
@@ -406,7 +409,9 @@ class RepoRAG:
 # CLI integration helper (optional): kept minimal and internal to avoid adding
 # new global commands outside aider package. Other modules can import and use
 # this function to implement /rag commands if desired.
-def cli_handle_rag(action: str, project_root: Path | str = ".") -> Optional[str]:
+def cli_handle_rag(
+    action: str, project_root: Path | str = ".", embedding_model: Optional[str] = None
+) -> Optional[str]:
     """A tiny helper intended for wiring into Commands.
 
     - action = 'init' -> build index if not present
@@ -415,7 +420,11 @@ def cli_handle_rag(action: str, project_root: Path | str = ".") -> Optional[str]
     Returns a status string for user feedback, or None.
     """
 
-    rag = RepoRAG(project_root)
+    embedding_config = None
+    if embedding_model:
+        embedding_config = {"provider": "huggingface", "model_name": embedding_model}
+
+    rag = RepoRAG(project_root, embedding_config=embedding_config)
     if action == "init":
         rag.build_index(force_reindex=False)
         return f"RAG index initialized at {rag.persist_dir}"
@@ -429,4 +438,3 @@ def cli_handle_rag(action: str, project_root: Path | str = ".") -> Optional[str]
         return "No RAG index found to remove."
     else:
         return "Unsupported RAG action. Use: init | update | deinit"
-

@@ -254,6 +254,18 @@ class Coder:
 
         lines.append(output)
 
+        # RAG indexing model (if configured)
+        try:
+            from aider.rag import DEFAULT_RAG_MODEL
+        except Exception:
+            DEFAULT_RAG_MODEL = None  # pragma: no cover
+
+        rag_model = getattr(getattr(self, "commands", None), "args", None)
+        rag_model = getattr(rag_model, "rag_model", None)
+        if rag_model or DEFAULT_RAG_MODEL:
+            show_model = rag_model or DEFAULT_RAG_MODEL
+            lines.append(f"Indexing Model: {show_model}")
+
         if self.edit_format == "architect":
             output = (
                 f"Editor model: {main_model.editor_model.name} with"
