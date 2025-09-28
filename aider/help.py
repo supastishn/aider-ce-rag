@@ -136,6 +136,7 @@ def get_index():
 class Help:
     def __init__(self):
         from llama_index.core import Settings
+        # Keep default help docs on HF for backward compatibility
         from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
         os.environ["TOKENIZERS_PARALLELISM"] = "true"

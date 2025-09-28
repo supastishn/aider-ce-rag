@@ -275,9 +275,10 @@ def get_parser(default_config_files, git_root):
         metavar="RAG_MODEL",
         default=None,
         help=(
-            "Embedding model to use for repository RAG indexing"
-            " (default: BAAI/bge-small-en-v1.5). Can also be set in config as 'rag-model' or"
-            " via env AIDER_RAG_MODEL."
+            "Embedding provider/model for repository RAG indexing."
+            " Default: litellm openai/text-embedding-small-3."
+            " Use 'huggingface/<model>' to force HuggingFace embeddings."
+            " Can also be set via config 'rag-model' or env AIDER_RAG_MODEL."
         ),
     )
     group.add_argument(

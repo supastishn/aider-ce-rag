@@ -18,8 +18,10 @@ Example
 
 Design Notes
 ------------
-- Uses llama_index StorageContext/VectorStoreIndex and HuggingFaceEmbedding
-  (BAAI/bge-small-en-v1.5 by default) just like aider.help.
+- Uses llama_index StorageContext/VectorStoreIndex and a configurable embedding
+  backend. By default this uses LiteLLM with "openai/text-embedding-small-3".
+  If configured to provider="huggingface", it falls back to
+  llama_index.embeddings.huggingface.HuggingFaceEmbedding like aider.help.
 - Persists under ~/.aider/caches/rag.<aider.__version__>/<project-hash> by
   default, so multiple repos can be indexed independently.
 - Respects .gitignore and .aiderignore via pathspec. Also filters to a
@@ -46,21 +48,24 @@ from typing import Iterable, List, Optional
 import pathspec
 
 from aider import __version__, utils
+from aider.embeddings_litellm import LitellmEmbeddingAdapter
 
 
-DEFAULT_RAG_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_RAG_MODEL = "openai/text-embedding-small-3"
 
 
 @dataclass
 class EmbeddingConfig:
     """Configuration for embeddings provider.
 
-    Currently supports HuggingFace via llama_index.embeddings.huggingface,
-    matching aider.help defaults.
+    Supports litellm (default) or HuggingFace via llama_index.embeddings.huggingface,
+    matching aider.help defaults when provider == 'huggingface'.
     """
 
-    provider: str = "huggingface"
+    provider: str = "litellm"  # or "huggingface"
     model_name: str = DEFAULT_RAG_MODEL
+    api_key: Optional[str] = None
+    batch_size: int = 100
 
 
 class RepoRAG:
@@ -213,6 +218,17 @@ class RepoRAG:
             Settings.embed_model = HuggingFaceEmbedding(
                 model_name=self.embedding_config.model_name
             )
+        elif self.embedding_config.provider == "litellm":
+            # Use LiteLLM-backed embeddings via our adapter
+            # Preserve any original OPENAI_API_BASE for embedding calls
+            original_api_base = os.environ.get("OPENAI_API_BASE")
+            adapter = LitellmEmbeddingAdapter(
+                model=self.embedding_config.model_name,
+                api_key=self.embedding_config.api_key or os.getenv("OPENAI_API_KEY"),
+                batch_size=self.embedding_config.batch_size,
+                original_openai_api_base=original_api_base,
+            )
+            Settings.embed_model = adapter
         else:
             # Allow alternative providers via Settings.embed_model injection by caller.
             # If provider is unknown, leave Settings.embed_model unchanged.
@@ -326,6 +342,16 @@ class RepoRAG:
         files = self.scan_files()
         if not quiet:
             print(f"RAG indexing {len(files)} files under {self.project_root}")
+        if not files:
+            # Nothing to index; create cache dir and return gracefully
+            self.persist_dir.mkdir(parents=True, exist_ok=True)
+            # Write a marker to indicate an empty index for diagnostics
+            try:
+                (self.persist_dir / "EMPTY").write_text("no files matched for RAG indexing\n")
+            except OSError:
+                pass
+            self._index = None
+            return
 
         md_parser = MarkdownNodeParser()
         simple_parser = SimpleNodeParser() if SimpleNodeParser else None
@@ -359,12 +385,16 @@ class RepoRAG:
                 nodes.append(doc)
 
         # Build and persist index
-        storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
-        index = VectorStoreIndex(nodes, storage_context=storage_context, show_progress=not quiet)
-
-        self.persist_base.mkdir(parents=True, exist_ok=True)
-        index.storage_context.persist(self.persist_dir)
-        self._index = index
+        try:
+            storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
+            index = VectorStoreIndex(
+                nodes, storage_context=storage_context, show_progress=not quiet
+            )
+            self.persist_base.mkdir(parents=True, exist_ok=True)
+            index.storage_context.persist(self.persist_dir)
+            self._index = index
+        except Exception as ex:
+            raise RuntimeError(f"Failed to build RAG index: {ex}")
 
     def _ensure_index(self):
         if self._index is not None:
@@ -420,9 +450,32 @@ def cli_handle_rag(
     Returns a status string for user feedback, or None.
     """
 
-    embedding_config = None
+    # Parse embedding_model which may be "provider/model" or just "model"
+    # Defaults: provider=litellm, model=openai/text-embedding-small-3
+    embedding_config = {"provider": "litellm", "model_name": DEFAULT_RAG_MODEL}
     if embedding_model:
-        embedding_config = {"provider": "huggingface", "model_name": embedding_model}
+        if "://" in embedding_model:
+            # Not expected, but avoid confusing provider parsing on URLs
+            embedding_config["model_name"] = embedding_model
+        elif "/" in embedding_model:
+            maybe_provider, rest = embedding_model.split("/", 1)
+            # If the prefix is a known provider, treat as provider/model
+            if maybe_provider.lower() in {"litellm", "huggingface", "openai"}:
+                if maybe_provider.lower() == "huggingface":
+                    embedding_config["provider"] = "huggingface"
+                    embedding_config["model_name"] = rest
+                else:
+                    # litellm or openai/<model> both go through litellm
+                    embedding_config["provider"] = "litellm"
+                    embedding_config["model_name"] = embedding_model
+            else:
+                # Unrecognized prefix, assume it's a litellm provider/model string
+                embedding_config["provider"] = "litellm"
+                embedding_config["model_name"] = embedding_model
+        else:
+            # Bare model name, assume litellm
+            embedding_config["provider"] = "litellm"
+            embedding_config["model_name"] = embedding_model
 
     rag = RepoRAG(project_root, embedding_config=embedding_config)
     if action == "init":

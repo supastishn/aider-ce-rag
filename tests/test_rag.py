@@ -14,7 +14,7 @@ def have_llama_index():
 
 
 @pytest.mark.skipif(not have_llama_index(), reason="llama_index not installed")
-def test_repo_rag_basic(tmp_path):
+def test_repo_rag_basic(tmp_path, monkeypatch):
     # Create tiny repo tree
     proj = tmp_path / "proj"
     proj.mkdir()
@@ -38,9 +38,29 @@ def init_db():
     # Build index under a temp cache dir to avoid touching user cache
     cache_dir = tmp_path / "cache"
 
+    # Mock litellm.embedding to avoid network
+    class FakeResp:
+        def __init__(self, data):
+            self.data = data
+
+    def fake_embedding(model, input, api_key=None):  # noqa: A002
+        return FakeResp([{"embedding": [0.01, 0.02, 0.03]} for _ in input])
+
+    from aider import llm as _llm
+
+    # Inject fake litellm module on the lazy loader instance
+    import types as _types
+
+    _fake_mod = _types.SimpleNamespace(embedding=fake_embedding)
+    # Set the lazy module so __getattr__ returns attributes from our fake module
+    _llm.litellm._lazy_module = _fake_mod
+
     from aider.rag import RepoRAG
 
-    rag = RepoRAG(project_root=proj, persist_dir=cache_dir)
+    rag = RepoRAG(project_root=proj, persist_dir=cache_dir, embedding_config={
+        "provider": "litellm",
+        "model_name": "openai/text-embedding-small-3",
+    })
     rag.build_index(force_reindex=True, quiet=True)
 
     # Query a known phrase
@@ -48,4 +68,3 @@ def init_db():
 
     # Should reference db.py or include snippet
     assert "db.py" in ctx or "init_db" in ctx
-

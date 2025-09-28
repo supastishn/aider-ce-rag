@@ -17,7 +17,8 @@ from aider import models, prompts, voice
 from aider.editor import pipe_editor
 from aider.format_settings import format_settings
 from aider.help import Help, install_help_extra
-from aider.rag import cli_handle_rag
+# Use the LiteLLM + Chroma implementation for repo RAG
+from aider.rag_litellm import cli_handle_rag
 from aider.io import CommandCompletionException
 from aider.llm import litellm
 from aider.repo import ANY_GIT_ERROR
@@ -137,7 +138,7 @@ class Commands:
         raise SwitchCoder(main_model=model)
 
     def cmd_rag_model(self, args):
-        "Set the RAG indexing embedding model"
+        "Set the RAG embedding provider/model. Usage: /rag-model [provider/]model"
 
         model_name = args.strip()
         if not model_name:
@@ -146,10 +147,10 @@ class Commands:
                 self.io.tool_output(f"Current RAG model: {current}")
             else:
                 self.io.tool_output(
-                    "No RAG model set. Using default if rag extras installed."
+                    "No RAG model set. Default: litellm openai/text-embedding-small-3"
                 )
             self.io.tool_output(
-                "Tip: persist via config file or env AIDER_RAG_MODEL."
+                "Tip: persist via config or env AIDER_RAG_MODEL. Prefix with provider/ to switch providers (eg 'huggingface/BAAI/bge-small-en-v1.5')."
             )
             return
 
@@ -328,6 +329,12 @@ class Commands:
                 self.io.tool_output(
                     "To enable RAG features, install rag extras: pip install 'aider-ce[rag]'"
                 )
+            return
+        except Exception as err:  # Be more informative than generic 'Unable to complete rag'
+            self.io.tool_error(f"RAG error: {err}")
+            self.io.tool_output(
+                "Tip: ensure OPENAI_API_KEY is set (for litellm), and try '/rag-model huggingface/BAAI/bge-small-en-v1.5' to fallback."
+            )
             return
 
         if msg:
@@ -604,6 +611,29 @@ class Commands:
 
         file_res.sort()
         res.extend(file_res)
+
+        # RAG token estimate from index stats (if available)
+        try:
+            from aider.rag_litellm import AiderRAG
+            import json as _json
+
+            rag = AiderRAG(project_path=self.coder.root if self.coder else ".")
+            stats_path = rag.db_path / "stats.json"
+            if stats_path.exists():
+                data = _json.loads(stats_path.read_text())
+                token_est = int(data.get("token_estimate") or 0)
+                chunks = int(data.get("chunks") or 0)
+                files_idx = int(data.get("files_indexed") or 0)
+                if token_est > 0:
+                    res.append(
+                        (
+                            token_est,
+                            f"rag index (~{chunks} chunks, {files_idx} files)",
+                            "/rag update to refresh",
+                        )
+                    )
+        except Exception:
+            pass
 
         # stub files
         for fname in self.coder.abs_read_only_stubs_fnames:
