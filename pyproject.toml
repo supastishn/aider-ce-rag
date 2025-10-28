@@ -29,11 +29,13 @@ aider-ce = "aider.main:main"
 dependencies = { file = "requirements/requirements.in" }
 
 [tool.setuptools.dynamic.optional-dependencies]
-dev = { file = "requirements/requirements-dev.in" }
-help = { file = "requirements/requirements-help.in" }
 browser = { file = "requirements/requirements-browser.in" }
+dev = { file = "requirements/requirements-dev.in" }
+fzf = { file = "requirements/requirements-fzf.in" }
+help = { file = "requirements/requirements-help.in" }
 playwright = { file = "requirements/requirements-playwright.in" }
 rag = { file = "requirements/requirements-rag.in" }
+voice = { file = "requirements/requirements-voice.in" }
 
 [tool.setuptools]
 include-package-data = true

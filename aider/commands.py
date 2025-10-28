@@ -2022,11 +2022,9 @@ class Commands:
             self.io.set_placeholder(user_input.rstrip())
 
     def cmd_edit(self, args=""):
-        "Alias for /editor: Open an editor to write a prompt"
-        return self.cmd_editor(args)
-
-    def cmd_history_search(self, args):
-        "Fuzzy search in history and paste it in the prompt"
+        "Fuzzy search in history to populate the prompt, or open an editor with <text>"
+        if args:
+            return self.cmd_editor(args)
         history_lines = self.io.get_input_history()
         selected_lines = run_fzf(history_lines)
         if selected_lines:
