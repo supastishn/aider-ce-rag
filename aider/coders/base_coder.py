@@ -1831,6 +1831,57 @@ class Coder:
 
         self.add_assistant_reply_to_cur_messages()
 
+        # RAG autoupdate: increment user-message counter and trigger update when reached
+        try:
+            autoupdate = None
+            if hasattr(self, "commands") and getattr(self, "commands", None) and hasattr(
+                self.commands, "args"
+            ):
+                autoupdate = getattr(self.commands.args, "rag_autoupdate", None)
+
+            # Fallback to env var if not configured in args
+            if not autoupdate:
+                env_val = os.environ.get("AIDER_RAG_AUTOUPDATE")
+                if env_val:
+                    try:
+                        autoupdate = int(env_val)
+                    except Exception:
+                        autoupdate = None
+
+            if autoupdate:
+                if not hasattr(self, "_rag_messages_since_update"):
+                    self._rag_messages_since_update = 0
+                # We count this processed user message
+                try:
+                    self._rag_messages_since_update += 1
+                except Exception:
+                    self._rag_messages_since_update = 1
+
+                if int(self._rag_messages_since_update) >= int(autoupdate):
+                    # reset and attempt update
+                    self._rag_messages_since_update = 0
+                    try:
+                        from aider.rag_litellm import cli_handle_rag
+
+                        root = getattr(self, "root", ".") or "."
+                        emb_model = None
+                        if hasattr(self, "commands") and hasattr(self.commands, "args"):
+                            emb_model = getattr(self.commands.args, "rag_model", None)
+                        try:
+                            res_msg = cli_handle_rag("update", root, embedding_model=emb_model)
+                            if res_msg:
+                                self.io.tool_output(f"RAG autoupdate: {res_msg}")
+                            else:
+                                self.io.tool_output("RAG autoupdate completed.")
+                        except Exception as _e:
+                            self.io.tool_warning(f"RAG autoupdate failed: {_e}")
+                    except Exception:
+                        # If import fails or cli not available, ignore gracefully
+                        pass
+        except Exception:
+            # Do not let RAG autoupdate errors affect main flow
+            pass
+
         if exhausted:
             if self.cur_messages and self.cur_messages[-1]["role"] == "user":
                 self.cur_messages += [

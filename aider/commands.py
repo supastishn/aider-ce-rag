@@ -390,6 +390,80 @@ class Commands:
         else:
             self.io.tool_error("Unknown RAG action or error occurred.")
 
+    def cmd_rag_autoupdate(self, args):
+        "Set or clear RAG autoupdate counter: /rag-autoupdate N | off"
+        val = args.strip().lower()
+        # Show current value
+        if not val:
+            current = getattr(getattr(self, "args", None), "rag_autoupdate", None)
+            if not current:
+                # fallback to env var
+                env_val = os.environ.get("AIDER_RAG_AUTOUPDATE")
+                current = int(env_val) if env_val and env_val.isdigit() else None
+            if current:
+                self.io.tool_output(f"RAG autoupdate: every {current} user messages")
+            else:
+                self.io.tool_output("RAG autoupdate is not set.")
+            return
+
+        if val in ("off", "0", "none"):
+            if hasattr(self, "args"):
+                setattr(self.args, "rag_autoupdate", None)
+            try:
+                if "AIDER_RAG_AUTOUPDATE" in os.environ:
+                    del os.environ["AIDER_RAG_AUTOUPDATE"]
+            except Exception:
+                pass
+            self.io.tool_output("RAG autoupdate disabled.")
+            return
+
+        try:
+            n = int(val)
+            if n <= 0:
+                raise ValueError("Must be positive")
+        except Exception:
+            self.io.tool_error("Please provide a positive integer or 'off'.")
+            return
+
+        if hasattr(self, "args"):
+            setattr(self.args, "rag_autoupdate", n)
+
+        persisted = False
+        env_file = getattr(self.args, "env_file", None) if hasattr(self, "args") else None
+        if env_file:
+            try:
+                env_path = Path(env_file)
+                if env_path.exists():
+                    text = env_path.read_text(encoding=getattr(self.io, "encoding", "utf-8"))
+                    lines = text.splitlines()
+                else:
+                    lines = []
+                found = False
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("AIDER_RAG_AUTOUPDATE="):
+                        lines[i] = f"AIDER_RAG_AUTOUPDATE={n}"
+                        found = True
+                        break
+                if not found:
+                    lines.append(f"AIDER_RAG_AUTOUPDATE={n}")
+                env_path.parent.mkdir(parents=True, exist_ok=True)
+                env_path.write_text("\n".join(lines) + "\n", encoding=getattr(self.io, "encoding", "utf-8"))
+                persisted = True
+            except Exception as e:
+                self.io.tool_warning(f"Unable to persist RAG autoupdate to env file {env_file}: {e}")
+
+        if not persisted:
+            try:
+                os.environ["AIDER_RAG_AUTOUPDATE"] = str(n)
+                persisted = True
+            except Exception:
+                persisted = False
+
+        if persisted:
+            self.io.tool_output(f"RAG autoupdate set to every {n} user messages (persisted)")
+        else:
+            self.io.tool_output(f"RAG autoupdate set to every {n} user messages.")
+
     def do_run(self, cmd_name, args):
         cmd_name = cmd_name.replace("-", "_")
         cmd_method_name = f"cmd_{cmd_name}"
