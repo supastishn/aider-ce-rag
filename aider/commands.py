@@ -157,7 +157,55 @@ class Commands:
         # Update the in-memory args so subsequent /rag init uses it
         if hasattr(self, "args"):
             setattr(self.args, "rag_model", model_name)
-        self.io.tool_output(f"RAG model set to: {model_name}")
+
+        persisted = False
+
+        # Try to persist to the env file if available (args.env_file)
+        env_file = None
+        try:
+            env_file = getattr(self.args, "env_file", None) if hasattr(self, "args") else None
+        except Exception:
+            env_file = None
+
+        if env_file:
+            try:
+                env_path = Path(env_file)
+                # Read existing lines if file exists
+                if env_path.exists():
+                    text = env_path.read_text(encoding=getattr(self.io, "encoding", "utf-8"))
+                    lines = text.splitlines()
+                    found = False
+                    for i, line in enumerate(lines):
+                        if line.strip().startswith("AIDER_RAG_MODEL="):
+                            lines[i] = f"AIDER_RAG_MODEL={model_name}"
+                            found = True
+                            break
+                    if not found:
+                        lines.append(f"AIDER_RAG_MODEL={model_name}")
+                    env_path.write_text("\n".join(lines) + "\n", encoding=getattr(self.io, "encoding", "utf-8"))
+                else:
+                    # Ensure parent dir exists, then write
+                    env_path.parent.mkdir(parents=True, exist_ok=True)
+                    env_path.write_text(f"AIDER_RAG_MODEL={model_name}\n", encoding=getattr(self.io, "encoding", "utf-8"))
+                persisted = True
+            except Exception as e:
+                # Warn but continue to try environment fallback
+                self.io.tool_warning(f"Unable to persist RAG model to env file {env_file}: {e}")
+
+        # Fallback: set in current environment so subprocesses in this session see it
+        if not persisted:
+            try:
+                os.environ["AIDER_RAG_MODEL"] = model_name
+                persisted = True
+            except Exception:
+                persisted = False
+
+        if persisted:
+            self.io.tool_output(f"RAG model set to: {model_name} (persisted)")
+        else:
+            self.io.tool_output(
+                f"RAG model set to: {model_name}. To persist across sessions, set AIDER_RAG_MODEL in your environment or config."
+            )
 
     def cmd_chat_mode(self, args):
         "Switch to a new chat mode"
