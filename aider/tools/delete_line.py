@@ -8,6 +8,27 @@ from .tool_utils import (
     handle_tool_error,
 )
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "DeleteLine",
+        "description": "Delete a single line from a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "line_number": {"type": "integer"},
+                "change_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["file_path", "line_number"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "deleteline"
+
 
 def _execute_delete_line(coder, file_path, line_number, change_id=None, dry_run=False):
     """
@@ -96,7 +117,7 @@ def _execute_delete_line(coder, file_path, line_number, change_id=None, dry_run=
             change_id,
         )
 
-        coder.aider_edited_files.add(rel_path)
+        coder.files_edited_by_tools.add(rel_path)
 
         # Format and return result
         success_message = f"Deleted line {line_num_int} in {file_path}"
@@ -110,3 +131,25 @@ def _execute_delete_line(coder, file_path, line_number, change_id=None, dry_run=
     except Exception as e:
         # Handle unexpected errors
         return handle_tool_error(coder, tool_name, e)
+
+
+def process_response(coder, params):
+    """
+    Process the DeleteLine tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    line_number = params.get("line_number")
+    change_id = params.get("change_id")
+    dry_run = params.get("dry_run", False)
+
+    if file_path is not None and line_number is not None:
+        return _execute_delete_line(coder, file_path, line_number, change_id, dry_run)
+    else:
+        return "Error: Missing required parameters for DeleteLine (file_path, line_number)"

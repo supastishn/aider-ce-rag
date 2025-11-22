@@ -12,6 +12,33 @@ from .tool_utils import (
     validate_file_for_edit,
 )
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "InsertBlock",
+        "description": "Insert a block of content into a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+                "after_pattern": {"type": "string"},
+                "before_pattern": {"type": "string"},
+                "occurrence": {"type": "integer", "default": 1},
+                "change_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": False},
+                "position": {"type": "string", "enum": ["top", "bottom"]},
+                "auto_indent": {"type": "boolean", "default": True},
+                "use_regex": {"type": "boolean", "default": False},
+            },
+            "required": ["file_path", "content"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "insertblock"
+
 
 def _execute_insert_block(
     coder,
@@ -66,10 +93,10 @@ def _execute_insert_block(
 
         if position:
             # Handle special positions
-            if position == "start_of_file":
+            if position == "start_of_file" or position == "top":
                 insertion_line_idx = 0
                 pattern_type = "at start of"
-            elif position == "end_of_file":
+            elif position == "end_of_file" or position == "bottom":
                 insertion_line_idx = len(lines)
                 pattern_type = "at end of"
             else:
@@ -187,6 +214,8 @@ def _execute_insert_block(
             change_id,
         )
 
+        coder.files_edited_by_tools.add(rel_path)
+
         # 9. Format and return result
         if position:
             success_message = f"Inserted block {pattern_type} {file_path}"
@@ -209,3 +238,51 @@ def _execute_insert_block(
             f"Error in InsertBlock: {str(e)}\n{traceback.format_exc()}"
         )  # Add traceback
         return f"Error: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the InsertBlock tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    content = params.get("content")
+    after_pattern = params.get("after_pattern")
+    before_pattern = params.get("before_pattern")
+    occurrence = params.get("occurrence", 1)
+    change_id = params.get("change_id")
+    dry_run = params.get("dry_run", False)
+    position = params.get("position")
+    auto_indent = params.get("auto_indent", True)
+    use_regex = params.get("use_regex", False)
+
+    if (
+        file_path is not None
+        and content is not None
+        and (after_pattern is not None or before_pattern is not None or position is not None)
+    ):
+        return _execute_insert_block(
+            coder,
+            file_path,
+            content,
+            after_pattern,
+            before_pattern,
+            occurrence,
+            change_id,
+            dry_run,
+            position,
+            auto_indent,
+            use_regex,
+        )
+
+    else:
+        return (
+            "Error: Missing required parameters for InsertBlock (file_path,"
+            " content, and either after_pattern or before_pattern)"
+        )

@@ -1,18 +1,49 @@
 import fnmatch
 import re
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "ViewFilesMatching",
+        "description": "View files containing a specific pattern.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The pattern to search for in file contents.",
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": "An optional glob pattern to filter which files are searched.",
+                },
+                "regex": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether the pattern is a regular expression. Defaults to False."
+                    ),
+                },
+            },
+            "required": ["pattern"],
+        },
+    },
+}
 
-def execute_view_files_matching(coder, search_pattern, file_pattern=None, regex=False):
+# Normalized tool name for lookup
+NORM_NAME = "viewfilesmatching"
+
+
+def execute_view_files_matching(coder, pattern, file_pattern=None, regex=False):
     """
-    Search for pattern (literal string or regex) in files and add matching files to context as read-only.
+    Search for pattern (literal string or regex) in files and return matching files as text.
 
     Args:
         coder: The Coder instance.
-        search_pattern (str): The pattern to search for.
+        pattern (str): The pattern to search for.
             Treated as a literal string by default.
         file_pattern (str, optional): Glob pattern to filter which files are searched.
             Defaults to None (search all files).
-        regex (bool, optional): If True, treat search_pattern as a regular expression.
+        regex (bool, optional): If True, treat pattern as a regular expression.
             Defaults to False.
 
     This tool lets the LLM search for content within files, mimicking
@@ -29,75 +60,96 @@ def execute_view_files_matching(coder, search_pattern, file_pattern=None, regex=
                     files_to_search.append(file)
 
             if not files_to_search:
-                return (
-                    f"No files matching '{file_pattern}' to search for pattern '{search_pattern}'"
-                )
+                return f"No files matching '{file_pattern}' to search for pattern '{pattern}'"
         else:
             # Search all files if no pattern provided
             files_to_search = coder.get_all_relative_files()
 
         # Search for pattern in files
         matches = {}
+        num_matches = 0
+        inspecific_search_flag = False
+
         for file in files_to_search:
             abs_path = coder.abs_root_path(file)
+
+            if num_matches >= 25:
+                inspecific_search_flag = True
+
             try:
+                if coder.repo.ignored_file(abs_path):
+                    continue
+
                 with open(abs_path, "r", encoding="utf-8") as f:
                     content = f.read()
                     match_count = 0
                     if regex:
                         try:
-                            matches_found = re.findall(search_pattern, content)
+                            matches_found = re.findall(pattern, content)
                             match_count = len(matches_found)
                         except re.error as e:
                             # Handle invalid regex patterns gracefully
-                            coder.io.tool_error(f"Invalid regex pattern '{search_pattern}': {e}")
+                            coder.io.tool_error(f"Invalid regex pattern '{pattern}': {e}")
                             # Skip this file for this search if regex is invalid
                             continue
                     else:
                         # Exact string matching
-                        match_count = content.count(search_pattern)
+                        match_count = content.count(pattern)
 
                     if match_count > 0:
                         matches[file] = match_count
+                        num_matches += 1
             except Exception:
                 # Skip files that can't be read (binary, etc.)
                 pass
 
-        # Limit the number of files added if there are too many matches
-        if len(matches) > coder.max_files_per_glob:
-            coder.io.tool_output(
-                f"⚠️ Found '{search_pattern}' in {len(matches)} files, "
-                f"limiting to {coder.max_files_per_glob} files with most matches."
-            )
-            # Sort by number of matches (most matches first)
-            sorted_matches = sorted(matches.items(), key=lambda x: x[1], reverse=True)
-            matches = dict(sorted_matches[: coder.max_files_per_glob])
-
-        # Add matching files to context
-        for file in matches:
-            coder._add_file_to_context(file)
-
-        # Return a user-friendly result
+        # Return formatted text instead of adding to context
         if matches:
             # Sort by number of matches (most matches first)
             sorted_matches = sorted(matches.items(), key=lambda x: x[1], reverse=True)
-            match_list = [f"{file} ({count} matches)" for file, count in sorted_matches[:5]]
+            match_list = [f"{file} ({count} matches)" for file, count in sorted_matches]
 
-            if len(sorted_matches) > 5:
-                coder.io.tool_output(
-                    f"🔍 Found '{search_pattern}' in {len(matches)} files:"
-                    f" {', '.join(match_list)} and {len(matches) - 5} more"
+            if len(matches) > 10:
+                result = (
+                    f"Found '{pattern}' in {len(matches)} files: {', '.join(match_list[:10])} and"
+                    f" {len(matches) - 10} more"
+                    "\nTry more specific search terms going forward"
+                    if inspecific_search_flag
+                    else ""
                 )
-                return (
-                    f"Found in {len(matches)} files: {', '.join(match_list)} and"
-                    f" {len(matches) - 5} more"
-                )
+                coder.io.tool_output(f"🔍 Found '{pattern}' in {len(matches)} files")
             else:
-                coder.io.tool_output(f"🔍 Found '{search_pattern}' in: {', '.join(match_list)}")
-                return f"Found in {len(matches)} files: {', '.join(match_list)}"
+                result = f"Found '{pattern}' in {len(matches)} files: {', '.join(match_list)}"
+                coder.io.tool_output(
+                    f"🔍 Found '{pattern}' in:"
+                    f" {', '.join(match_list[:5])}{' and more' if len(matches) > 5 else ''}"
+                )
+
+            return result
         else:
-            coder.io.tool_output(f"⚠️ Pattern '{search_pattern}' not found in any files")
+            coder.io.tool_output(f"⚠️ Pattern '{pattern}' not found in any files")
             return "Pattern not found in any files"
     except Exception as e:
         coder.io.tool_error(f"Error in ViewFilesMatching: {str(e)}")
         return f"Error: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the ViewFilesMatching tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    pattern = params.get("pattern")
+    file_pattern = params.get("file_pattern")
+    regex = params.get("regex", False)
+
+    if pattern is not None:
+        return execute_view_files_matching(coder, pattern, file_pattern, regex)
+    else:
+        return "Error: Missing 'pattern' parameter for ViewFilesMatching"

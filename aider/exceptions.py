@@ -20,6 +20,7 @@ EXCEPTIONS = [
         "The API provider is not able to authenticate you. Check your API key.",
     ),
     ExInfo("AzureOpenAIError", True, None),
+    ExInfo("BadGatewayError", False, None),
     ExInfo("BadRequestError", False, None),
     ExInfo("BudgetExceededError", True, None),
     ExInfo(
@@ -28,6 +29,7 @@ EXCEPTIONS = [
         "The API provider has refused the request due to a safety policy about the content.",
     ),
     ExInfo("ContextWindowExceededError", False, None),  # special case handled in base_coder
+    ExInfo("ErrorEventError", True, None),
     ExInfo("ImageFetchError", True, "The API cannot fetch an image"),
     ExInfo("InternalServerError", True, "The API provider's servers are down or overloaded."),
     ExInfo("InvalidRequestError", True, None),
@@ -70,6 +72,9 @@ class LiteLLMExceptions:
             ex = getattr(litellm, var, "default")
 
             if ex != "default":
+                if not issubclass(ex, BaseException):
+                    continue
+
                 self.exceptions[ex] = self.exception_info[var]
 
     def exceptions_tuple(self):

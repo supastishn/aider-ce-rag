@@ -1,7 +1,33 @@
 import os
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "Ls",
+        "description": "List files in a directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "directory": {
+                    "type": "string",
+                    "description": "The directory to list.",
+                },
+            },
+            "required": ["directory"],
+        },
+    },
+}
 
-def execute_ls(coder, dir_path):
+# Normalized tool name for lookup
+NORM_NAME = "ls"
+
+
+def execute_ls(coder, dir_path=None, directory=None):
+    # Handle both positional and keyword arguments for backward compatibility
+    if dir_path is None and directory is not None:
+        dir_path = directory
+    elif dir_path is None:
+        return "Error: Missing directory parameter"
     """
     List files in directory and optionally add some to context.
 
@@ -47,3 +73,21 @@ def execute_ls(coder, dir_path):
     except Exception as e:
         coder.io.tool_error(f"Error in ls: {str(e)}")
         return f"Error: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the Ls tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    directory = params.get("directory")
+    if directory is not None:
+        return execute_ls(coder, directory)
+    else:
+        return "Error: Missing 'directory' parameter for Ls"

@@ -1,8 +1,56 @@
-import shlex
 import shutil
 from pathlib import Path
 
+import oslex
+
 from aider.run_cmd import run_cmd_subprocess
+
+schema = {
+    "type": "function",
+    "function": {
+        "name": "Grep",
+        "description": "Search for a pattern in files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The pattern to search for.",
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": "Glob pattern for files to search. Defaults to '*'.",
+                },
+                "directory": {
+                    "type": "string",
+                    "description": "Directory to search in. Defaults to '.'.",
+                },
+                "use_regex": {
+                    "type": "boolean",
+                    "description": "Whether to use regex. Defaults to False.",
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether to perform a case-insensitive search. Defaults to False."
+                    ),
+                },
+                "context_before": {
+                    "type": "integer",
+                    "description": "Number of lines to show before a match. Defaults to 5.",
+                },
+                "context_after": {
+                    "type": "integer",
+                    "description": "Number of lines to show after a match. Defaults to 5.",
+                },
+            },
+            "required": ["pattern"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "grep"
 
 
 def _find_search_tool():
@@ -68,6 +116,9 @@ def _execute_grep(
             cmd_args.append("-n")  # Line numbers for rg and grep
         # ag includes line numbers by default
 
+        if tool_name in ["rg"]:
+            cmd_args.append("--heading")  # Filename above output for ripgrep
+
         # Context lines (Before and After)
         if context_before > 0:
             # All tools use -B for lines before
@@ -117,7 +168,7 @@ def _execute_grep(
         cmd_args.extend([pattern, str(search_dir_path)])
 
         # Convert list to command string for run_cmd_subprocess
-        command_string = shlex.join(cmd_args)
+        command_string = oslex.join(cmd_args)
 
         coder.io.tool_output(f"⚙️ Executing {tool_name}: {command_string}")
 
@@ -169,3 +220,37 @@ def _execute_grep(
         cmd_str_info = f"'{command_string}' " if "command_string" in locals() else ""
         coder.io.tool_error(f"Error executing {tool_name} command {cmd_str_info}: {str(e)}")
         return f"Error executing {tool_name}: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the Grep tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    pattern = params.get("pattern")
+    file_pattern = params.get("file_pattern", "*")  # Default to all files
+    directory = params.get("directory", ".")  # Default to current directory
+    use_regex = params.get("use_regex", False)  # Default to literal search
+    case_insensitive = params.get("case_insensitive", False)  # Default to case-sensitive
+    context_before = params.get("context_before", 5)
+    context_after = params.get("context_after", 5)
+
+    if pattern is not None:
+        return _execute_grep(
+            coder,
+            pattern,
+            file_pattern,
+            directory,
+            use_regex,
+            case_insensitive,
+            context_before,
+            context_after,
+        )
+    else:
+        return "Error: Missing required 'pattern' parameter for Grep"

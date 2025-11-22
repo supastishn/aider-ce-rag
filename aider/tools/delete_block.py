@@ -10,6 +10,31 @@ from .tool_utils import (
     validate_file_for_edit,
 )
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "DeleteBlock",
+        "description": "Delete a block of lines from a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "start_pattern": {"type": "string"},
+                "end_pattern": {"type": "string"},
+                "line_count": {"type": "integer"},
+                "near_context": {"type": "string"},
+                "occurrence": {"type": "integer", "default": 1},
+                "change_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["file_path", "start_pattern"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "deleteblock"
+
 
 def _execute_delete_block(
     coder,
@@ -103,6 +128,7 @@ def _execute_delete_block(
             change_id,
         )
 
+        coder.files_edited_by_tools.add(rel_path)
         # 8. Format and return result, adding line range to success message
         success_message = (
             f"Deleted {num_deleted} lines ({start_line + 1}-{end_line + 1}) (from"
@@ -118,3 +144,39 @@ def _execute_delete_block(
     except Exception as e:
         # Handle unexpected errors
         return handle_tool_error(coder, tool_name, e)
+
+
+def process_response(coder, params):
+    """
+    Process the DeleteBlock tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    start_pattern = params.get("start_pattern")
+    end_pattern = params.get("end_pattern")
+    line_count = params.get("line_count")
+    near_context = params.get("near_context")
+    occurrence = params.get("occurrence", 1)
+    change_id = params.get("change_id")
+    dry_run = params.get("dry_run", False)
+
+    if file_path is not None and start_pattern is not None:
+        return _execute_delete_block(
+            coder,
+            file_path,
+            start_pattern,
+            end_pattern,
+            line_count,
+            near_context,
+            occurrence,
+            change_id,
+            dry_run,
+        )
+    else:
+        return "Error: Missing required parameters for DeleteBlock (file_path, start_pattern)"

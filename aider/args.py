@@ -176,11 +176,11 @@ def get_parser(default_config_files, git_root):
         help="Use architect edit format for the main chat",
     )
     group.add_argument(
-        "--navigator",
+        "--agent",
         action="store_const",
         dest="edit_format",
-        const="navigator",
-        help="Use navigator edit format for the main chat (autonomous file management)",
+        const="agent",
+        help="Use agent edit format for the main chat (autonomous file management)",
     )
     group.add_argument(
         "--auto-accept-architect",
@@ -248,7 +248,7 @@ def get_parser(default_config_files, git_root):
         default=None,
         help=(
             "The maximum number of tokens in the conversation before context compaction is"
-            " triggered. (default: 80%% of model's context window)"
+            " triggered. (default: 80% of model's context window)"
         ),
     )
     group.add_argument(
@@ -330,7 +330,12 @@ def get_parser(default_config_files, git_root):
             " (default: current directory)"
         ),
     )
-
+    group.add_argument(
+        "--map-memory-cache",
+        action="store_true",
+        help="Store repo map in memory (default: False)",
+        default=False,
+    )
     ##########
     group = parser.add_argument_group("History Files")
     default_input_history_file = (
@@ -760,7 +765,20 @@ def get_parser(default_config_files, git_root):
         help="Print the system prompts and exit (debug)",
         default=False,
     )
-
+    group.add_argument(
+        "--linear-output",
+        action="store_true",
+        help=(
+            "Run input and output sequentially instead of us simultaneous streams (default: False)"
+        ),
+        default=False,
+    )
+    group.add_argument(
+        "--debug",
+        action="store_true",
+        help="Turn on verbose debugging (default: False)",
+        default=False,
+    )
     ##########
     group = parser.add_argument_group("Voice settings")
     group.add_argument(
@@ -786,6 +804,24 @@ def get_parser(default_config_files, git_root):
     ######
     group = parser.add_argument_group("Other settings")
     group.add_argument(
+        "--preserve-todo-list",
+        action="store_true",
+        help="Preserve the existing .aider.todo.txt file on startup (default: False)",
+        default=False,
+    )
+    group.add_argument(
+        "--auto-save",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable automatic saving of sessions as 'auto-save' (default: False)",
+    )
+    group.add_argument(
+        "--auto-load",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable automatic loading of 'auto-save' session on startup (default: False)",
+    )
+    group.add_argument(
         "--disable-playwright",
         action="store_true",
         help="Never prompt for or attempt to install Playwright for web scraping (default: False).",
@@ -795,13 +831,13 @@ def get_parser(default_config_files, git_root):
         "--file",
         action="append",
         metavar="FILE",
-        help="specify a file to edit (can be used multiple times)",
+        help="specify a file to edit (can be used multiple times, glob patterns supported)",
     ).complete = shtab.FILE
     group.add_argument(
         "--read",
         action="append",
         metavar="FILE",
-        help="specify a read-only file (can be used multiple times)",
+        help="specify a read-only file (can be used multiple times, glob patterns supported)",
     ).complete = shtab.FILE
     group.add_argument(
         "--vim",
@@ -879,6 +915,12 @@ def get_parser(default_config_files, git_root):
             " or home directory)"
         ),
     ).complete = shtab.FILE
+    group.add_argument(
+        "--agent-config",
+        metavar="AGENT_CONFIG_JSON",
+        help="Specify Agent Mode configuration as a JSON string",
+        default=None,
+    )
     # This is a duplicate of the argument in the preparser and is a no-op by this time of
     # argument parsing, but it's here so that the help is displayed as expected.
     group.add_argument(

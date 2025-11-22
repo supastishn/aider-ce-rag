@@ -3,6 +3,31 @@ import traceback
 
 from .tool_utils import generate_unified_diff_snippet
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "ExtractLines",
+        "description": "Extract lines from a source file and append them to a target file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source_file_path": {"type": "string"},
+                "target_file_path": {"type": "string"},
+                "start_pattern": {"type": "string"},
+                "end_pattern": {"type": "string"},
+                "line_count": {"type": "integer"},
+                "near_context": {"type": "string"},
+                "occurrence": {"type": "integer", "default": 1},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["source_file_path", "target_file_path", "start_pattern"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "extractlines"
+
 
 def _execute_extract_lines(
     coder,
@@ -248,8 +273,9 @@ def _execute_extract_lines(
             coder.io.tool_error(f"Error tracking target change for ExtractLines: {track_e}")
 
         # --- Update Context ---
-        coder.aider_edited_files.add(rel_source_path)
-        coder.aider_edited_files.add(rel_target_path)
+        coder.files_edited_by_tools.add(rel_source_path)
+        coder.files_edited_by_tools.add(rel_target_path)
+
         if not target_exists:
             # Add the newly created file to editable context
             coder.abs_fnames.add(abs_target_path)
@@ -274,3 +300,42 @@ def _execute_extract_lines(
     except Exception as e:
         coder.io.tool_error(f"Error in ExtractLines: {str(e)}\n{traceback.format_exc()}")
         return f"Error: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the ExtractLines tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    source_file_path = params.get("source_file_path")
+    target_file_path = params.get("target_file_path")
+    start_pattern = params.get("start_pattern")
+    end_pattern = params.get("end_pattern")
+    line_count = params.get("line_count")
+    near_context = params.get("near_context")
+    occurrence = params.get("occurrence", 1)
+    dry_run = params.get("dry_run", False)
+
+    if source_file_path and target_file_path and start_pattern:
+        return _execute_extract_lines(
+            coder,
+            source_file_path,
+            target_file_path,
+            start_pattern,
+            end_pattern,
+            line_count,
+            near_context,
+            occurrence,
+            dry_run,
+        )
+    else:
+        return (
+            "Error: Missing required parameters for ExtractLines (source_file_path,"
+            " target_file_path, start_pattern)"
+        )

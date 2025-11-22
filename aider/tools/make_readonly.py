@@ -1,3 +1,25 @@
+schema = {
+    "type": "function",
+    "function": {
+        "name": "MakeReadonly",
+        "description": "Make an editable file read-only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the file to make read-only.",
+                },
+            },
+            "required": ["file_path"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "makereadonly"
+
+
 def _execute_make_readonly(coder, file_path):
     """
     Convert an editable file to a read-only file.
@@ -27,3 +49,21 @@ def _execute_make_readonly(coder, file_path):
     except Exception as e:
         coder.io.tool_error(f"Error making file read-only: {str(e)}")
         return f"Error: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the MakeReadonly tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    if file_path is not None:
+        return _execute_make_readonly(coder, file_path)
+    else:
+        return "Error: Missing 'file_path' parameter for MakeReadonly"

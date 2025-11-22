@@ -8,6 +8,29 @@ from .tool_utils import (
     handle_tool_error,
 )
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "ReplaceLines",
+        "description": "Replace a range of lines in a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+                "new_content": {"type": "string"},
+                "change_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["file_path", "start_line", "end_line", "new_content"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "replacelines"
+
 
 def _execute_replace_lines(
     coder, file_path, start_line, end_line, new_content, change_id=None, dry_run=False
@@ -139,7 +162,7 @@ def _execute_replace_lines(
             change_id,
         )
 
-        coder.aider_edited_files.add(rel_path)
+        coder.files_edited_by_tools.add(rel_path)
         replaced_count = end_line - start_line + 1
         new_count = len(new_lines)
 
@@ -158,3 +181,37 @@ def _execute_replace_lines(
     except Exception as e:
         # Handle unexpected errors
         return handle_tool_error(coder, tool_name, e)
+
+
+def process_response(coder, params):
+    """
+    Process the ReplaceLines tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    start_line = params.get("start_line")
+    end_line = params.get("end_line")
+    new_content = params.get("new_content")
+    change_id = params.get("change_id")
+    dry_run = params.get("dry_run", False)
+
+    if (
+        file_path is not None
+        and start_line is not None
+        and end_line is not None
+        and new_content is not None
+    ):
+        return _execute_replace_lines(
+            coder, file_path, start_line, end_line, new_content, change_id, dry_run
+        )
+    else:
+        return (
+            "Error: Missing required parameters for ReplaceLines (file_path,"
+            " start_line, end_line, new_content)"
+        )

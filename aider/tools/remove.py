@@ -1,5 +1,30 @@
 import time
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "Remove",
+        "description": (
+            "Remove a file from the chat context. Should be used proactively to keep con"
+            "Should be used after editing a file when all edits are done "
+            "and the file is no longer necessary in context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The path to the file to remove.",
+                },
+            },
+            "required": ["file_path"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "remove"
+
 
 def _execute_remove(coder, file_path):
     """
@@ -46,3 +71,21 @@ def _execute_remove(coder, file_path):
     except Exception as e:
         coder.io.tool_error(f"Error removing file: {str(e)}")
         return f"Error: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the Remove tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    if file_path is not None:
+        return _execute_remove(coder, file_path)
+    else:
+        return "Error: Missing 'file_path' parameter for Remove"

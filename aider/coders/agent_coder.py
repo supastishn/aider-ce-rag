@@ -10,7 +10,7 @@ import time
 import traceback
 
 # Add necessary imports if not already present
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -23,72 +23,101 @@ from aider.change_tracker import ChangeTracker
 from aider.mcp.server import LocalServer
 from aider.repo import ANY_GIT_ERROR
 
-# Import run_cmd for potentially interactive execution and run_cmd_subprocess for guaranteed non-interactive
-from aider.tools.command import _execute_command
-from aider.tools.command_interactive import _execute_command_interactive
-from aider.tools.delete_block import _execute_delete_block
-from aider.tools.delete_line import _execute_delete_line
-from aider.tools.delete_lines import _execute_delete_lines
-from aider.tools.extract_lines import _execute_extract_lines
-from aider.tools.grep import _execute_grep
-from aider.tools.indent_lines import _execute_indent_lines
-from aider.tools.insert_block import _execute_insert_block
-from aider.tools.list_changes import _execute_list_changes
-from aider.tools.ls import execute_ls
-from aider.tools.make_editable import _execute_make_editable
-from aider.tools.make_readonly import _execute_make_readonly
-from aider.tools.remove import _execute_remove
-from aider.tools.replace_all import _execute_replace_all
-from aider.tools.replace_line import _execute_replace_line
-from aider.tools.replace_lines import _execute_replace_lines
-from aider.tools.replace_text import _execute_replace_text
-from aider.tools.show_numbered_context import execute_show_numbered_context
-from aider.tools.undo_change import _execute_undo_change
-from aider.tools.view import execute_view
+# Import tool modules for registry
+# Import tool modules for registry
+from aider.tools import (
+    command,
+    command_interactive,
+    delete_block,
+    delete_line,
+    delete_lines,
+    extract_lines,
+    finished,
+    git_branch,
+    git_diff,
+    git_log,
+    git_remote,
+    git_show,
+    git_status,
+    grep,
+    indent_lines,
+    insert_block,
+    list_changes,
+    ls,
+    make_editable,
+    make_readonly,
+    remove,
+    replace_all,
+    replace_line,
+    replace_lines,
+    replace_text,
+    show_numbered_context,
+    undo_change,
+    update_todo_list,
+    view,
+    view_files_matching,
+    view_files_with_symbol,
+)
 
-# Import tool functions
-from aider.tools.view_files_at_glob import execute_view_files_at_glob
-from aider.tools.view_files_matching import execute_view_files_matching
-from aider.tools.view_files_with_symbol import _execute_view_files_with_symbol
-
+from .agent_prompts import AgentPrompts
 from .base_coder import ChatChunks, Coder
 from .editblock_coder import do_replace, find_original_update_blocks, find_similar_lines
-from .navigator_legacy_prompts import NavigatorLegacyPrompts
-from .navigator_prompts import NavigatorPrompts
 
 
-class NavigatorCoder(Coder):
+class AgentCoder(Coder):
     """Mode where the LLM autonomously manages which files are in context."""
 
-    edit_format = "navigator"
-
-    # TODO: We'll turn on granular editing by default once those tools stabilize
-    use_granular_editing = False
+    edit_format = "agent"
 
     def __init__(self, *args, **kwargs):
         # Initialize appropriate prompt set before calling parent constructor
         # This needs to happen before super().__init__ so the parent class has access to gpt_prompts
-        self.gpt_prompts = (
-            NavigatorPrompts() if self.use_granular_editing else NavigatorLegacyPrompts()
-        )
+        self.gpt_prompts = AgentPrompts()
 
         # Dictionary to track recently removed files
         self.recently_removed = {}
+
+        # Tool usage history
+        self.tool_usage_history = []
+        self.tool_usage_retries = 10
+        self.read_tools = {
+            "viewfilesatglob",
+            "viewfilesmatching",
+            "ls",
+            "viewfileswithsymbol",
+            "grep",
+            "listchanges",
+            "extractlines",
+            "shownumberedcontext",
+        }
+        self.write_tools = {
+            "command",
+            "commandinteractive",
+            "insertblock",
+            "replaceblock",
+            "replaceall",
+            "replacetext",
+            "undochange",
+        }
 
         # Configuration parameters
         self.max_tool_calls = 100  # Maximum number of tool calls per response
 
         # Context management parameters
+        # Will be overridden by agent_config if provided
         self.large_file_token_threshold = (
             25000  # Files larger than this in tokens are considered large
         )
-        self.max_files_per_glob = 50  # Maximum number of files to add at once via glob/grep
 
-        # Enable context management by default only in navigator mode
-        self.context_management_enabled = True  # Enabled by default for navigator mode
+        # Enable context management by default only in agent mode
+        self.context_management_enabled = True  # Enabled by default for agent mode
 
         # Initialize change tracker for granular editing
         self.change_tracker = ChangeTracker()
+
+        # Initialize tool registry
+        self.args = kwargs.get("args")
+        self._tool_registry = self._build_tool_registry()
 
         # Track files added during current exploration
         self.files_added_in_exploration = set()
@@ -109,12 +138,143 @@ class NavigatorCoder(Coder):
         self.context_blocks_cache = {}
         self.tokens_calculated = False
 
-        super().__init__(*args, **kwargs)
-        self.initialize_local_tools()
+        self.skip_cli_confirmations = False
 
-    def initialize_local_tools(self):
-        if not self.use_granular_editing:
-            return
+        self.agent_finished = False
+        self._get_agent_config()
+        super().__init__(*args, **kwargs)
+
+    def _build_tool_registry(self):
+        """
+        Build a registry of available tools with their normalized names and process_response functions.
+        Handles agent configuration with includelist/excludelist functionality.
+
+        Returns:
+            dict: Mapping of normalized tool names to tool modules
+        """
+        registry = {}
+
+        # Add tools that have been imported
+        tool_modules = [
+            command,
+            command_interactive,
+            delete_block,
+            delete_line,
+            delete_lines,
+            extract_lines,
+            finished,
+            git_branch,
+            git_diff,
+            git_log,
+            git_remote,
+            git_show,
+            git_status,
+            grep,
+            indent_lines,
+            insert_block,
+            list_changes,
+            ls,
+            make_editable,
+            make_readonly,
+            remove,
+            replace_all,
+            replace_line,
+            replace_lines,
+            replace_text,
+            show_numbered_context,
+            undo_change,
+            update_todo_list,
+            view,
+            view_files_matching,
+            view_files_with_symbol,
+        ]
+
+        # Process agent configuration if provided
+        agent_config = self._get_agent_config()
+        tools_includelist = agent_config.get(
+            "tools_includelist", agent_config.get("tools_whitelist", [])
+        )
+        tools_excludelist = agent_config.get(
+            "tools_excludelist", agent_config.get("tools_blacklist", [])
+        )
+
+        # Always include essential tools regardless of includelist/excludelist
+        essential_tools = {"makeeditable", "replacetext", "view", "finished"}
+        for module in tool_modules:
+            if hasattr(module, "NORM_NAME") and hasattr(module, "process_response"):
+                tool_name = module.NORM_NAME
+
+                # Check if tool should be included based on configuration
+                should_include = True
+
+                # If includelist is specified, only include tools in includelist
+                if tools_includelist:
+                    should_include = tool_name in tools_includelist
+
+                # Always include essential tools
+                if tool_name in essential_tools:
+                    should_include = True
+
+                # Exclude tools in excludelist (unless they're essential)
+                if tool_name in tools_excludelist and tool_name not in essential_tools:
+                    should_include = False
+
+                if should_include:
+                    registry[tool_name] = module
+
+        return registry
+
+    def _get_agent_config(self):
+        """
+        Parse and return agent configuration from args.agent_config.
+
+        Returns:
+            dict: Agent configuration with defaults for missing values
+        """
+        config = {}
+
+        # Check if agent_config is provided via args
+        if (
+            hasattr(self, "args")
+            and self.args
+            and hasattr(self.args, "agent_config")
+            and self.args.agent_config
+        ):
+            try:
+                config = json.loads(self.args.agent_config)
+            except (json.JSONDecodeError, TypeError) as e:
+                self.io.tool_warning(f"Failed to parse agent-config JSON: {e}")
+                return {}
+
+        # Set defaults for missing values
+        if "large_file_token_threshold" not in config:
+            config["large_file_token_threshold"] = 25000
+        if "tools_includelist" not in config:
+            config["tools_includelist"] = []
+        if "tools_excludelist" not in config:
+            config["tools_excludelist"] = []
+
+        # Apply configuration to instance
+        self.large_file_token_threshold = config["large_file_token_threshold"]
+        self.skip_cli_confirmations = config.get(
+            "skip_cli_confirmations", config.get("yolo", False)
+        )
+
+        return config
+
+    def get_local_tool_schemas(self):
+        """Returns the JSON schemas for all local tools using the tool registry."""
+        schemas = []
+
+        # Get schemas from the tool registry
+        for tool_module in self._tool_registry.values():
+            if hasattr(tool_module, "schema"):
+                schemas.append(tool_module.schema)
+
+        return schemas
+
+    async def initialize_mcp_tools(self):
+        await super().initialize_mcp_tools()
 
         local_tools = self.get_local_tool_schemas()
         if not local_tools:
@@ -133,491 +293,6 @@ class NavigatorCoder(Coder):
 
         if "local_tools" not in [name for name, _ in self.mcp_tools]:
             self.mcp_tools.append((local_server.name, local_tools))
-            self.functions = self.get_tool_list()
-
-    def get_local_tool_schemas(self):
-        """Returns the JSON schemas for all local tools."""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "ViewFilesAtGlob",
-                    "description": "View files matching a glob pattern.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "string",
-                                "description": "The glob pattern to match files.",
-                            },
-                        },
-                        "required": ["pattern"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ViewFilesMatching",
-                    "description": "View files containing a specific pattern.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "string",
-                                "description": "The pattern to search for in file contents.",
-                            },
-                            "file_pattern": {
-                                "type": "string",
-                                "description": (
-                                    "An optional glob pattern to filter which files are searched."
-                                ),
-                            },
-                            "regex": {
-                                "type": "boolean",
-                                "description": (
-                                    "Whether the pattern is a regular expression. Defaults to"
-                                    " False."
-                                ),
-                            },
-                        },
-                        "required": ["pattern"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "Ls",
-                    "description": "List files in a directory.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "directory": {
-                                "type": "string",
-                                "description": "The directory to list.",
-                            },
-                        },
-                        "required": ["directory"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "View",
-                    "description": "View a specific file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {
-                                "type": "string",
-                                "description": "The path to the file to view.",
-                            },
-                        },
-                        "required": ["file_path"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "Remove",
-                    "description": "Remove a file from the chat context.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {
-                                "type": "string",
-                                "description": "The path to the file to remove.",
-                            },
-                        },
-                        "required": ["file_path"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "MakeEditable",
-                    "description": "Make a read-only file editable.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {
-                                "type": "string",
-                                "description": "The path to the file to make editable.",
-                            },
-                        },
-                        "required": ["file_path"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "MakeReadonly",
-                    "description": "Make an editable file read-only.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {
-                                "type": "string",
-                                "description": "The path to the file to make read-only.",
-                            },
-                        },
-                        "required": ["file_path"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ViewFilesWithSymbol",
-                    "description": (
-                        "View files that contain a specific symbol (e.g., class, function)."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "symbol": {
-                                "type": "string",
-                                "description": "The symbol to search for.",
-                            },
-                        },
-                        "required": ["symbol"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "Command",
-                    "description": "Execute a shell command.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command_string": {
-                                "type": "string",
-                                "description": "The shell command to execute.",
-                            },
-                        },
-                        "required": ["command_string"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "CommandInteractive",
-                    "description": "Execute a shell command interactively.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command_string": {
-                                "type": "string",
-                                "description": "The interactive shell command to execute.",
-                            },
-                        },
-                        "required": ["command_string"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "Grep",
-                    "description": "Search for a pattern in files.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "pattern": {
-                                "type": "string",
-                                "description": "The pattern to search for.",
-                            },
-                            "file_pattern": {
-                                "type": "string",
-                                "description": "Glob pattern for files to search. Defaults to '*'.",
-                            },
-                            "directory": {
-                                "type": "string",
-                                "description": "Directory to search in. Defaults to '.'.",
-                            },
-                            "use_regex": {
-                                "type": "boolean",
-                                "description": "Whether to use regex. Defaults to False.",
-                            },
-                            "case_insensitive": {
-                                "type": "boolean",
-                                "description": (
-                                    "Whether to perform a case-insensitive search. Defaults to"
-                                    " False."
-                                ),
-                            },
-                            "context_before": {
-                                "type": "integer",
-                                "description": (
-                                    "Number of lines to show before a match. Defaults to 5."
-                                ),
-                            },
-                            "context_after": {
-                                "type": "integer",
-                                "description": (
-                                    "Number of lines to show after a match. Defaults to 5."
-                                ),
-                            },
-                        },
-                        "required": ["pattern"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ReplaceText",
-                    "description": "Replace text in a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "find_text": {"type": "string"},
-                            "replace_text": {"type": "string"},
-                            "near_context": {"type": "string"},
-                            "occurrence": {"type": "integer", "default": 1},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "find_text", "replace_text"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ReplaceAll",
-                    "description": "Replace all occurrences of text in a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "find_text": {"type": "string"},
-                            "replace_text": {"type": "string"},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "find_text", "replace_text"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "InsertBlock",
-                    "description": "Insert a block of content into a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "content": {"type": "string"},
-                            "after_pattern": {"type": "string"},
-                            "before_pattern": {"type": "string"},
-                            "occurrence": {"type": "integer", "default": 1},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                            "position": {"type": "string", "enum": ["top", "bottom"]},
-                            "auto_indent": {"type": "boolean", "default": True},
-                            "use_regex": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "DeleteBlock",
-                    "description": "Delete a block of lines from a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "start_pattern": {"type": "string"},
-                            "end_pattern": {"type": "string"},
-                            "line_count": {"type": "integer"},
-                            "near_context": {"type": "string"},
-                            "occurrence": {"type": "integer", "default": 1},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "start_pattern"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ReplaceLine",
-                    "description": "Replace a single line in a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "line_number": {"type": "integer"},
-                            "new_content": {"type": "string"},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "line_number", "new_content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ReplaceLines",
-                    "description": "Replace a range of lines in a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "start_line": {"type": "integer"},
-                            "end_line": {"type": "integer"},
-                            "new_content": {"type": "string"},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "start_line", "end_line", "new_content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "IndentLines",
-                    "description": "Indent a block of lines in a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "start_pattern": {"type": "string"},
-                            "end_pattern": {"type": "string"},
-                            "line_count": {"type": "integer"},
-                            "indent_levels": {"type": "integer", "default": 1},
-                            "near_context": {"type": "string"},
-                            "occurrence": {"type": "integer", "default": 1},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "start_pattern"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "DeleteLine",
-                    "description": "Delete a single line from a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "line_number": {"type": "integer"},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "line_number"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "DeleteLines",
-                    "description": "Delete a range of lines from a file.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "start_line": {"type": "integer"},
-                            "end_line": {"type": "integer"},
-                            "change_id": {"type": "string"},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["file_path", "start_line", "end_line"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "UndoChange",
-                    "description": "Undo a previously applied change.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "change_id": {"type": "string"},
-                            "file_path": {"type": "string"},
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ListChanges",
-                    "description": "List recent changes made.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "limit": {"type": "integer", "default": 10},
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ExtractLines",
-                    "description": (
-                        "Extract lines from a source file and append them to a target file."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "source_file_path": {"type": "string"},
-                            "target_file_path": {"type": "string"},
-                            "start_pattern": {"type": "string"},
-                            "end_pattern": {"type": "string"},
-                            "line_count": {"type": "integer"},
-                            "near_context": {"type": "string"},
-                            "occurrence": {"type": "integer", "default": 1},
-                            "dry_run": {"type": "boolean", "default": False},
-                        },
-                        "required": ["source_file_path", "target_file_path", "start_pattern"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "ShowNumberedContext",
-                    "description": (
-                        "Show numbered lines of context around a pattern or line number."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string"},
-                            "pattern": {"type": "string"},
-                            "line_number": {"type": "integer"},
-                            "context_lines": {"type": "integer", "default": 3},
-                        },
-                        "required": ["file_path"],
-                    },
-                },
-            },
-        ]
 
     async def _execute_local_tool_calls(self, tool_calls_list):
         tool_responses = []
@@ -646,61 +321,44 @@ class NavigatorCoder(Coder):
                 all_results_content = []
                 norm_tool_name = tool_name.lower()
 
-                for params in parsed_args_list:
-                    single_result = ""
-                    # Dispatch to the correct tool execution function
-                    if norm_tool_name == "viewfilesatglob":
-                        single_result = execute_view_files_at_glob(self, **params)
-                    elif norm_tool_name == "viewfilesmatching":
-                        single_result = execute_view_files_matching(self, **params)
-                    elif norm_tool_name == "ls":
-                        single_result = execute_ls(self, **params)
-                    elif norm_tool_name == "view":
-                        single_result = execute_view(self, **params)
-                    elif norm_tool_name == "remove":
-                        single_result = _execute_remove(self, **params)
-                    elif norm_tool_name == "makeeditable":
-                        single_result = _execute_make_editable(self, **params)
-                    elif norm_tool_name == "makereadonly":
-                        single_result = _execute_make_readonly(self, **params)
-                    elif norm_tool_name == "viewfileswithsymbol":
-                        single_result = _execute_view_files_with_symbol(self, **params)
-                    elif norm_tool_name == "command":
-                        single_result = _execute_command(self, **params)
-                    elif norm_tool_name == "commandinteractive":
-                        single_result = _execute_command_interactive(self, **params)
-                    elif norm_tool_name == "grep":
-                        single_result = _execute_grep(self, **params)
-                    elif norm_tool_name == "replacetext":
-                        single_result = _execute_replace_text(self, **params)
-                    elif norm_tool_name == "replaceall":
-                        single_result = _execute_replace_all(self, **params)
-                    elif norm_tool_name == "insertblock":
-                        single_result = _execute_insert_block(self, **params)
-                    elif norm_tool_name == "deleteblock":
-                        single_result = _execute_delete_block(self, **params)
-                    elif norm_tool_name == "replaceline":
-                        single_result = _execute_replace_line(self, **params)
-                    elif norm_tool_name == "replacelines":
-                        single_result = _execute_replace_lines(self, **params)
-                    elif norm_tool_name == "indentlines":
-                        single_result = _execute_indent_lines(self, **params)
-                    elif norm_tool_name == "deleteline":
-                        single_result = _execute_delete_line(self, **params)
-                    elif norm_tool_name == "deletelines":
-                        single_result = _execute_delete_lines(self, **params)
-                    elif norm_tool_name == "undochange":
-                        single_result = _execute_undo_change(self, **params)
-                    elif norm_tool_name == "listchanges":
-                        single_result = _execute_list_changes(self, **params)
-                    elif norm_tool_name == "extractlines":
-                        single_result = _execute_extract_lines(self, **params)
-                    elif norm_tool_name == "shownumberedcontext":
-                        single_result = execute_show_numbered_context(self, **params)
-                    else:
-                        single_result = f"Error: Unknown local tool name '{tool_name}'"
+                tasks = []
 
-                    all_results_content.append(str(single_result))
+                # Use the tool registry for execution
+                if norm_tool_name in self._tool_registry:
+                    tool_module = self._tool_registry[norm_tool_name]
+                    for params in parsed_args_list:
+                        # Use the process_response function from the tool module
+                        result = tool_module.process_response(self, params)
+                        # Handle async functions
+                        if asyncio.iscoroutine(result):
+                            tasks.append(result)
+                        else:
+                            tasks.append(asyncio.to_thread(lambda: result))
+                else:
+                    # Handle MCP tools for tools not in registry
+                    if self.mcp_tools:
+                        for server_name, server_tools in self.mcp_tools:
+                            if any(
+                                t.get("function", {}).get("name") == norm_tool_name
+                                for t in server_tools
+                            ):
+                                server = next(
+                                    (s for s in self.mcp_servers if s.name == server_name), None
+                                )
+                                if server:
+                                    for params in parsed_args_list:
+                                        tasks.append(
+                                            self._execute_mcp_tool(server, norm_tool_name, params)
+                                        )
+                                    break
+                        else:
+                            all_results_content.append(f"Error: Unknown tool name '{tool_name}'")
+                    else:
+                        all_results_content.append(f"Error: Unknown tool name '{tool_name}'")
+
+                if tasks:
+                    task_results = await asyncio.gather(*tasks)
+                    all_results_content.extend(str(res) for res in task_results)
 
                 result_message = "\n\n".join(all_results_content)
 
@@ -714,13 +372,12 @@ class NavigatorCoder(Coder):
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "name": tool_name,
                     "content": result_message,
                 }
             )
         return tool_responses
 
-    def _execute_mcp_tool(self, server, tool_name, params):
+    async def _execute_mcp_tool(self, server, tool_name, params):
         """Helper to execute a single MCP tool call, created from legacy format."""
 
         # This is a simplified, synchronous wrapper around async logic
@@ -767,10 +424,8 @@ class NavigatorCoder(Coder):
                     f"Executing {tool_name} on {server.name} failed: \n  Error: {e}\n"
                 )
                 return f"Error executing tool call {tool_name}: {e}"
-            finally:
-                await server.disconnect()
 
-        return asyncio.run(_exec_async())
+        return await _exec_async()
 
     def _calculate_context_block_tokens(self, force=False):
         """
@@ -840,6 +495,8 @@ class NavigatorCoder(Coder):
             content = self.get_context_symbol_outline()
         elif block_name == "context_summary":
             content = self.get_context_summary()
+        elif block_name == "todo_list":
+            content = self.get_todo_list()
 
         # Cache the result if it's not None
         if content is not None:
@@ -864,16 +521,6 @@ class NavigatorCoder(Coder):
 
         # Otherwise generate and cache the block
         return self._generate_context_block(block_name)
-
-    def set_granular_editing(self, enabled):
-        """
-        Switch between granular editing tools and legacy search/replace.
-
-        Args:
-            enabled (bool): True to use granular editing tools, False to use legacy search/replace
-        """
-        self.use_granular_editing = enabled
-        self.gpt_prompts = NavigatorPrompts() if enabled else NavigatorLegacyPrompts()
 
     def get_context_symbol_outline(self):
         """
@@ -965,63 +612,11 @@ class NavigatorCoder(Coder):
 
         This approach preserves prefix caching while providing fresh context information.
         """
-        # First get the normal chat chunks from the parent method without calling super
-        # We'll manually build the chunks to control placement of context blocks
-        chunks = self.format_chat_chunks_base()
-
-        # If enhanced context blocks are not enabled, just return the base chunks
+        # If enhanced context blocks are not enabled, use the base implementation
         if not self.use_enhanced_context:
-            return chunks
+            return super().format_chat_chunks()
 
-        # Make sure token counts are updated - using centralized method
-        # This also populates the context block cache
-        self._calculate_context_block_tokens()
-
-        # Get blocks from cache to avoid regenerating them
-        env_context = self.get_cached_context_block("environment_info")
-        dir_structure = self.get_cached_context_block("directory_structure")
-        git_status = self.get_cached_context_block("git_status")
-        symbol_outline = self.get_cached_context_block("symbol_outline")
-
-        # Context summary needs special handling because it depends on other blocks
-        context_summary = self.get_context_summary()
-
-        # 1. Add relatively static blocks BEFORE done_messages
-        # These blocks change less frequently and can be part of the cacheable prefix
-        static_blocks = []
-        if dir_structure:
-            static_blocks.append(dir_structure)
-        if env_context:
-            static_blocks.append(env_context)
-
-        if static_blocks:
-            static_message = "\n\n".join(static_blocks)
-            # Insert as a system message right before done_messages
-            chunks.done.insert(0, dict(role="system", content=static_message))
-
-        # 2. Add dynamic blocks AFTER chat_files
-        # These blocks change with the current files in context
-        dynamic_blocks = []
-        if context_summary:
-            dynamic_blocks.append(context_summary)
-        if symbol_outline:
-            dynamic_blocks.append(symbol_outline)
-        if git_status:
-            dynamic_blocks.append(git_status)
-
-        if dynamic_blocks:
-            dynamic_message = "\n\n".join(dynamic_blocks)
-            # Append as a system message after chat_files
-            chunks.chat_files.append(dict(role="system", content=dynamic_message))
-
-        return chunks
-
-    def format_chat_chunks_base(self):
-        """
-        Create base chat chunks without enhanced context blocks.
-        This is a copy of the parent's format_chat_chunks method to avoid
-        calling super() which would create a recursive loop.
-        """
+        # Build chunks from scratch to avoid duplication with enhanced context blocks
         self.choose_fence()
         main_sys = self.fmt_system_prompt(self.gpt_prompts.main_system)
 
@@ -1072,12 +667,65 @@ class NavigatorCoder(Coder):
         chunks.examples = example_messages
 
         self.summarize_end()
-        chunks.done = self.done_messages
+        chunks.done = list(self.done_messages)
 
         chunks.repo = self.get_repo_messages()
         chunks.readonly_files = self.get_readonly_files_messages()
         chunks.chat_files = self.get_chat_files_messages()
 
+        # Make sure token counts are updated - using centralized method
+        # This also populates the context block cache
+        self._calculate_context_block_tokens()
+
+        # Get blocks from cache to avoid regenerating them
+        env_context = self.get_cached_context_block("environment_info")
+        dir_structure = self.get_cached_context_block("directory_structure")
+        git_status = self.get_cached_context_block("git_status")
+        symbol_outline = self.get_cached_context_block("symbol_outline")
+        todo_list = self.get_cached_context_block("todo_list")
+
+        # Context summary needs special handling because it depends on other blocks
+        context_summary = self.get_context_summary()
+
+        # 1. Add relatively static blocks BEFORE done_messages
+        # These blocks change less frequently and can be part of the cacheable prefix
+        static_blocks = []
+        if dir_structure:
+            static_blocks.append(dir_structure)
+        if env_context:
+            static_blocks.append(env_context)
+
+        if static_blocks:
+            static_message = "\n\n".join(static_blocks)
+            # Insert as a system message right before done_messages
+            chunks.done.insert(0, dict(role="system", content=static_message))
+
+        # 2. Add dynamic blocks AFTER chat_files
+        # These blocks change with the current files in context
+        dynamic_blocks = []
+        if todo_list:
+            dynamic_blocks.append(todo_list)
+        if context_summary:
+            dynamic_blocks.append(context_summary)
+        if symbol_outline:
+            dynamic_blocks.append(symbol_outline)
+        if git_status:
+            dynamic_blocks.append(git_status)
+
+        # Add tool usage context if there are repetitive tools
+        if hasattr(self, "tool_usage_history") and self.tool_usage_history:
+            repetitive_tools = self._get_repetitive_tools()
+            if repetitive_tools:
+                tool_context = self._generate_tool_context(repetitive_tools)
+                if tool_context:
+                    dynamic_blocks.append(tool_context)
+
+        if dynamic_blocks:
+            dynamic_message = "\n\n".join(dynamic_blocks)
+            # Append as a system message after chat_files
+            chunks.chat_files.append(dict(role="system", content=dynamic_message))
+
+        # Add reminder if needed
         if self.gpt_prompts.system_reminder:
             reminder_message = [
                 dict(
@@ -1293,7 +941,23 @@ class NavigatorCoder(Coder):
             self.io.tool_error(f"Error generating environment info: {str(e)}")
             return None
 
-    def reply_completed(self):
+    async def process_tool_calls(self, tool_call_response):
+        """
+        Track tool usage before calling the base implementation.
+        """
+        self.agent_finished = False
+        self.auto_save_session()
+
+        if self.partial_response_tool_calls:
+            for tool_call in self.partial_response_tool_calls:
+                self.tool_usage_history.append(tool_call.get("function", {}).get("name"))
+
+        if len(self.tool_usage_history) > self.tool_usage_retries:
+            self.tool_usage_history.pop(0)
+
+        return await super().process_tool_calls(tool_call_response)
+
+    async def reply_completed(self):
         """Process the completed response from the LLM.
 
         This is a key method that:
@@ -1305,44 +969,26 @@ class NavigatorCoder(Coder):
         iteratively discover and analyze relevant files before providing
         a final answer to the user's question.
         """
-        # In granular editing mode, tool calls are handled by BaseCoder's process_tool_calls.
-        # This method is now only for legacy tool call format and search/replace blocks.
-        if self.use_granular_editing:
-            # Handle SEARCH/REPLACE blocks
-            content = self.partial_response_content
-            if not content or not content.strip():
-                return True
-
-            # Check for search/replace blocks
-            has_search = "<<<<<<< SEARCH" in content
-            has_divider = "=======" in content
-            has_replace = ">>>>>>> REPLACE" in content
-            if has_search and has_divider and has_replace:
-                self.io.tool_output("Detected edit blocks, applying changes...")
-                edited_files = self._apply_edits_from_response()
-                if self.reflected_message:
-                    return False  # Trigger reflection if edits failed
-
-                # If edits were successful, we might want to reflect.
-                # For now, let's consider the turn complete.
-
-            # Since tool calls are handled earlier, we finalize the turn.
-            self.tool_call_count = 0
-            self.files_added_in_exploration = set()
-            self.move_back_cur_messages(None)
-            return True
-
         # Legacy tool call processing for use_granular_editing=False
         content = self.partial_response_content
         if not content or not content.strip():
+            if len(self.tool_usage_history) > self.tool_usage_retries:
+                self.tool_usage_history = []
             return True
         original_content = content  # Keep the original response
 
-        # Process tool commands: returns content with tool calls removed, results, flag if any tool calls were found,
-        # and the content before the last '---' line
-        processed_content, result_messages, tool_calls_found, content_before_last_separator = (
-            self._process_tool_commands(content)
-        )
+        # Process tool commands: returns content with tool calls removed, results, flag if any tool calls were found
+        (
+            processed_content,
+            result_messages,
+            tool_calls_found,
+            content_before_last_separator,
+            tool_names_this_turn,
+        ) = await self._process_tool_commands(content)
+
+        if self.agent_finished:
+            self.tool_usage_history = []
+            return True
 
         # Since we are no longer suppressing, the partial_response_content IS the final content.
         # We might want to update it to the processed_content (without tool calls) if we don't
@@ -1369,8 +1015,8 @@ class NavigatorCoder(Coder):
             edit_match = has_search_before and has_divider_before and has_replace_before
 
         if edit_match:
-            self.io.tool_output("Detected edit blocks, applying changes within Navigator...")
-            edited_files = self._apply_edits_from_response()
+            self.io.tool_output("Detected edit blocks, applying changes within Agent...")
+            edited_files = await self._apply_edits_from_response()
             # If _apply_edits_from_response set a reflected_message (due to errors),
             # return False to trigger a reflection loop.
             if self.reflected_message:
@@ -1408,6 +1054,7 @@ class NavigatorCoder(Coder):
         if tool_calls_found and self.num_reflections < self.max_reflections:
             # Reset tool counter for next iteration
             self.tool_call_count = 0
+
             # Clear exploration files for the next round
             self.files_added_in_exploration = set()
 
@@ -1460,15 +1107,64 @@ class NavigatorCoder(Coder):
 
         # After applying edits OR determining no edits were needed (and no reflection needed),
         # the turn is complete. Reset counters and finalize history.
+
+        # Auto-commit any files edited by granular tools
+        if self.files_edited_by_tools:
+            saved_message = await self.auto_commit(self.files_edited_by_tools)
+            if not saved_message and hasattr(self.gpt_prompts, "files_content_gpt_edits_no_repo"):
+                saved_message = self.gpt_prompts.files_content_gpt_edits_no_repo
+            self.move_back_cur_messages(saved_message)
+
         self.tool_call_count = 0
         self.files_added_in_exploration = set()
+        self.files_edited_by_tools = set()
         # Move cur_messages to done_messages
         self.move_back_cur_messages(
             None
         )  # Pass None as we handled commit message earlier if needed
-        return True  # Indicate exploration is finished for this round
 
-    def _process_tool_commands(self, content):
+        return False  # Always Loop Until the Finished Tool is Called
+
+    async def _execute_tool_with_registry(self, norm_tool_name, params):
+        """
+        Execute a tool using the tool registry.
+
+        Args:
+            norm_tool_name: Normalized tool name (lowercase)
+            params: Dictionary of parameters
+
+        Returns:
+            str: Result message
+        """
+        # Check if tool exists in registry
+        if norm_tool_name in self._tool_registry:
+            tool_module = self._tool_registry[norm_tool_name]
+            try:
+                # Use the process_response function from the tool module
+                result = tool_module.process_response(self, params)
+                # Handle async functions
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result
+            except Exception as e:
+                self.io.tool_error(
+                    f"Error during {norm_tool_name} execution: {e}\n{traceback.format_exc()}"
+                )
+                return f"Error executing {norm_tool_name}: {str(e)}"
+
+        # Handle MCP tools for tools not in registry
+        if self.mcp_tools:
+            for server_name, server_tools in self.mcp_tools:
+                if any(t.get("function", {}).get("name") == norm_tool_name for t in server_tools):
+                    server = next((s for s in self.mcp_servers if s.name == server_name), None)
+                    if server:
+                        return await self._execute_mcp_tool(server, norm_tool_name, params)
+                    else:
+                        return f"Error: Could not find server instance for {server_name}"
+
+        return f"Error: Unknown tool name '{norm_tool_name}'"
+
+    async def _process_tool_commands(self, content):
         """
         Process tool commands in the `[tool_call(name, param=value)]` format within the content.
 
@@ -1485,6 +1181,7 @@ class NavigatorCoder(Coder):
         tool_calls_found = False
         call_count = 0
         max_calls = self.max_tool_calls
+        tool_names = []
 
         # Check if there's a '---' separator and only process tool calls after the LAST one
         separator_marker = "---"
@@ -1493,7 +1190,7 @@ class NavigatorCoder(Coder):
         # If there's no separator, treat the entire content as before the separator
         if len(content_parts) == 1:
             # Return the original content with no tool calls processed, and the content itself as before_separator
-            return content, result_messages, False, content
+            return content, result_messages, False, content, tool_names
 
         # Take everything before the last separator (including intermediate separators)
         content_before_separator = separator_marker.join(content_parts[:-1])
@@ -1683,6 +1380,8 @@ class NavigatorCoder(Coder):
                 else:
                     raise ValueError("Tool name must be an identifier or a string literal")
 
+                tool_names.append(tool_name)
+
                 # Extract keyword arguments
                 for keyword in call_node.keywords:
                     key = keyword.arg
@@ -1759,405 +1458,13 @@ class NavigatorCoder(Coder):
                 result_messages.append(f"[Result (Parse Error): {result_message}]")
                 continue
 
-            # Execute the tool based on its name
+            # Execute the tool using the registry
             try:
                 # Normalize tool name for case-insensitive matching
                 norm_tool_name = tool_name.lower()
 
-                if norm_tool_name == "viewfilesatglob":
-                    pattern = params.get("pattern")
-                    if pattern is not None:
-                        # Call the imported function
-                        result_message = execute_view_files_at_glob(self, pattern)
-                    else:
-                        result_message = "Error: Missing 'pattern' parameter for ViewFilesAtGlob"
-                elif norm_tool_name == "viewfilesmatching":
-                    pattern = params.get("pattern")
-                    file_pattern = params.get("file_pattern")  # Optional
-                    regex = params.get("regex", False)  # Default to False if not provided
-                    if pattern is not None:
-                        result_message = execute_view_files_matching(
-                            self, pattern, file_pattern, regex
-                        )
-                    else:
-                        result_message = "Error: Missing 'pattern' parameter for ViewFilesMatching"
-                elif norm_tool_name == "ls":
-                    directory = params.get("directory")
-                    if directory is not None:
-                        result_message = execute_ls(self, directory)
-                    else:
-                        result_message = "Error: Missing 'directory' parameter for Ls"
-                elif norm_tool_name == "view":
-                    file_path = params.get("file_path")
-                    if file_path is not None:
-                        result_message = execute_view(self, file_path)
-                    else:
-                        result_message = "Error: Missing 'file_path' parameter for View"
-                elif norm_tool_name == "remove":
-                    file_path = params.get("file_path")
-                    if file_path is not None:
-                        result_message = _execute_remove(self, file_path)
-                    else:
-                        result_message = "Error: Missing 'file_path' parameter for Remove"
-                elif norm_tool_name == "makeeditable":
-                    file_path = params.get("file_path")
-                    if file_path is not None:
-                        result_message = _execute_make_editable(self, file_path)
-                    else:
-                        result_message = "Error: Missing 'file_path' parameter for MakeEditable"
-                elif norm_tool_name == "makereadonly":
-                    file_path = params.get("file_path")
-                    if file_path is not None:
-                        result_message = _execute_make_readonly(self, file_path)
-                    else:
-                        result_message = "Error: Missing 'file_path' parameter for MakeReadonly"
-                elif norm_tool_name == "viewfileswithsymbol":
-                    symbol = params.get("symbol")
-                    if symbol is not None:
-                        # Call the imported function from the tools directory
-                        result_message = _execute_view_files_with_symbol(self, symbol)
-                    else:
-                        result_message = "Error: Missing 'symbol' parameter for ViewFilesWithSymbol"
-
-                # Command tools
-                elif norm_tool_name == "command":
-                    command_string = params.get("command_string")
-                    if command_string is not None:
-                        result_message = _execute_command(self, command_string)
-                    else:
-                        result_message = "Error: Missing 'command_string' parameter for Command"
-                elif norm_tool_name == "commandinteractive":
-                    command_string = params.get("command_string")
-                    if command_string is not None:
-                        result_message = _execute_command_interactive(self, command_string)
-                    else:
-                        result_message = (
-                            "Error: Missing 'command_string' parameter for CommandInteractive"
-                        )
-
-                # Grep tool
-                elif norm_tool_name == "grep":
-                    pattern = params.get("pattern")
-                    file_pattern = params.get("file_pattern", "*")  # Default to all files
-                    directory = params.get("directory", ".")  # Default to current directory
-                    use_regex = params.get("use_regex", False)  # Default to literal search
-                    case_insensitive = params.get(
-                        "case_insensitive", False
-                    )  # Default to case-sensitive
-                    context_before = params.get("context_before", 5)
-                    context_after = params.get("context_after", 5)
-
-                    if pattern is not None:
-                        # Import the function if not already imported (it should be)
-                        from aider.tools.grep import _execute_grep
-
-                        result_message = _execute_grep(
-                            self,
-                            pattern,
-                            file_pattern,
-                            directory,
-                            use_regex,
-                            case_insensitive,
-                            context_before,
-                            context_after,
-                        )
-                    else:
-                        result_message = "Error: Missing required 'pattern' parameter for Grep"
-
-                # Granular editing tools
-                elif norm_tool_name == "replacetext":
-                    file_path = params.get("file_path")
-                    find_text = params.get("find_text")
-                    replace_text = params.get("replace_text")
-                    near_context = params.get("near_context")
-                    occurrence = params.get("occurrence", 1)  # Default to first occurrence
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)  # Default to False
-
-                    if file_path is not None and find_text is not None and replace_text is not None:
-                        result_message = _execute_replace_text(
-                            self,
-                            file_path,
-                            find_text,
-                            replace_text,
-                            near_context,
-                            occurrence,
-                            change_id,
-                            dry_run,
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for ReplaceText (file_path,"
-                            " find_text, replace_text)"
-                        )
-
-                elif norm_tool_name == "replaceall":
-                    file_path = params.get("file_path")
-                    find_text = params.get("find_text")
-                    replace_text = params.get("replace_text")
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)  # Default to False
-
-                    if file_path is not None and find_text is not None and replace_text is not None:
-                        result_message = _execute_replace_all(
-                            self, file_path, find_text, replace_text, change_id, dry_run
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for ReplaceAll (file_path,"
-                            " find_text, replace_text)"
-                        )
-
-                elif norm_tool_name == "insertblock":
-                    file_path = params.get("file_path")
-                    content = params.get("content")
-                    after_pattern = params.get("after_pattern")
-                    before_pattern = params.get("before_pattern")
-                    occurrence = params.get("occurrence", 1)  # Default 1
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)  # Default False
-                    position = params.get("position")
-                    auto_indent = params.get("auto_indent", True)  # Default True
-                    use_regex = params.get("use_regex", False)  # Default False
-
-                    if (
-                        file_path is not None
-                        and content is not None
-                        and (
-                            after_pattern is not None
-                            or before_pattern is not None
-                            or position is not None
-                        )
-                    ):
-                        result_message = _execute_insert_block(
-                            self,
-                            file_path,
-                            content,
-                            after_pattern,
-                            before_pattern,
-                            occurrence,
-                            change_id,
-                            dry_run,
-                            position,
-                            auto_indent,
-                            use_regex,
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for InsertBlock (file_path,"
-                            " content, and either after_pattern or before_pattern)"
-                        )
-
-                elif norm_tool_name == "deleteblock":
-                    file_path = params.get("file_path")
-                    start_pattern = params.get("start_pattern")
-                    end_pattern = params.get("end_pattern")
-                    line_count = params.get("line_count")
-                    near_context = params.get("near_context")  # New
-                    occurrence = params.get("occurrence", 1)  # New, default 1
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)  # New, default False
-
-                    if file_path is not None and start_pattern is not None:
-                        result_message = _execute_delete_block(
-                            self,
-                            file_path,
-                            start_pattern,
-                            end_pattern,
-                            line_count,
-                            near_context,
-                            occurrence,
-                            change_id,
-                            dry_run,
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for DeleteBlock (file_path,"
-                            " start_pattern)"
-                        )
-
-                elif norm_tool_name == "replaceline":
-                    file_path = params.get("file_path")
-                    line_number = params.get("line_number")
-                    new_content = params.get("new_content")
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)  # New, default False
-
-                    if (
-                        file_path is not None
-                        and line_number is not None
-                        and new_content is not None
-                    ):
-                        result_message = _execute_replace_line(
-                            self, file_path, line_number, new_content, change_id, dry_run
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for ReplaceLine (file_path,"
-                            " line_number, new_content)"
-                        )
-
-                elif norm_tool_name == "replacelines":
-                    file_path = params.get("file_path")
-                    start_line = params.get("start_line")
-                    end_line = params.get("end_line")
-                    new_content = params.get("new_content")
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)  # New, default False
-
-                    if (
-                        file_path is not None
-                        and start_line is not None
-                        and end_line is not None
-                        and new_content is not None
-                    ):
-                        result_message = _execute_replace_lines(
-                            self, file_path, start_line, end_line, new_content, change_id, dry_run
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for ReplaceLines (file_path,"
-                            " start_line, end_line, new_content)"
-                        )
-
-                elif norm_tool_name == "indentlines":
-                    file_path = params.get("file_path")
-                    start_pattern = params.get("start_pattern")
-                    end_pattern = params.get("end_pattern")
-                    line_count = params.get("line_count")
-                    indent_levels = params.get("indent_levels", 1)  # Default to indent 1 level
-                    near_context = params.get("near_context")  # New
-                    occurrence = params.get("occurrence", 1)  # New, default 1
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)  # New, default False
-
-                    if file_path is not None and start_pattern is not None:
-                        result_message = _execute_indent_lines(
-                            self,
-                            file_path,
-                            start_pattern,
-                            end_pattern,
-                            line_count,
-                            indent_levels,
-                            near_context,
-                            occurrence,
-                            change_id,
-                            dry_run,
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for IndentLines (file_path,"
-                            " start_pattern)"
-                        )
-
-                elif norm_tool_name == "deleteline":
-                    file_path = params.get("file_path")
-                    line_number = params.get("line_number")
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)
-
-                    if file_path is not None and line_number is not None:
-                        result_message = _execute_delete_line(
-                            self, file_path, line_number, change_id, dry_run
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for DeleteLine (file_path,"
-                            " line_number)"
-                        )
-
-                elif norm_tool_name == "deletelines":
-                    file_path = params.get("file_path")
-                    start_line = params.get("start_line")
-                    end_line = params.get("end_line")
-                    change_id = params.get("change_id")
-                    dry_run = params.get("dry_run", False)
-
-                    if file_path is not None and start_line is not None and end_line is not None:
-                        result_message = _execute_delete_lines(
-                            self, file_path, start_line, end_line, change_id, dry_run
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for DeleteLines (file_path,"
-                            " start_line, end_line)"
-                        )
-
-                elif norm_tool_name == "undochange":
-                    change_id = params.get("change_id")
-                    file_path = params.get("file_path")
-
-                    result_message = _execute_undo_change(self, change_id, file_path)
-
-                elif norm_tool_name == "listchanges":
-                    file_path = params.get("file_path")
-                    limit = params.get("limit", 10)
-
-                    result_message = _execute_list_changes(self, file_path, limit)
-
-                elif norm_tool_name == "extractlines":
-                    source_file_path = params.get("source_file_path")
-                    target_file_path = params.get("target_file_path")
-                    start_pattern = params.get("start_pattern")
-                    end_pattern = params.get("end_pattern")
-                    line_count = params.get("line_count")
-                    near_context = params.get("near_context")
-                    occurrence = params.get("occurrence", 1)
-                    dry_run = params.get("dry_run", False)
-
-                    if source_file_path and target_file_path and start_pattern:
-                        result_message = _execute_extract_lines(
-                            self,
-                            source_file_path,
-                            target_file_path,
-                            start_pattern,
-                            end_pattern,
-                            line_count,
-                            near_context,
-                            occurrence,
-                            dry_run,
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for ExtractLines (source_file_path,"
-                            " target_file_path, start_pattern)"
-                        )
-
-                elif norm_tool_name == "shownumberedcontext":
-                    file_path = params.get("file_path")
-                    pattern = params.get("pattern")
-                    line_number = params.get("line_number")
-                    context_lines = params.get("context_lines", 3)  # Default context
-
-                    if file_path is not None and (pattern is not None or line_number is not None):
-                        result_message = execute_show_numbered_context(
-                            self, file_path, pattern, line_number, context_lines
-                        )
-                    else:
-                        result_message = (
-                            "Error: Missing required parameters for ViewNumberedContext (file_path"
-                            " and either pattern or line_number)"
-                        )
-
-                else:
-                    result_message = f"Error: Unknown tool name '{tool_name}'"
-                    if self.mcp_tools:
-                        for server_name, server_tools in self.mcp_tools:
-                            if any(
-                                t.get("function", {}).get("name") == tool_name for t in server_tools
-                            ):
-                                server = next(
-                                    (s for s in self.mcp_servers if s.name == server_name), None
-                                )
-                                if server:
-                                    result_message = self._execute_mcp_tool(
-                                        server, tool_name, params
-                                    )
-                                else:
-                                    result_message = (
-                                        f"Error: Could not find server instance for {server_name}"
-                                    )
-                                break
+                # Use the tool registry for execution
+                result_message = await self._execute_tool_with_registry(norm_tool_name, params)
 
             except Exception as e:
                 result_message = f"Error executing {tool_name}: {str(e)}"
@@ -2176,12 +1483,124 @@ class NavigatorCoder(Coder):
         # Return the content with tool calls removed
         modified_content = processed_content
 
-        # Update internal counter
-        self.tool_call_count += call_count
+        return (
+            modified_content,
+            result_messages,
+            tool_calls_found,
+            content_before_separator,
+            tool_names,
+        )
 
-        return modified_content, result_messages, tool_calls_found, content_before_separator
+    def _get_repetitive_tools(self):
+        """
+        Identifies repetitive tool usage patterns from a flat list of tool calls.
 
-    def _apply_edits_from_response(self):
+        This method checks for the following patterns in order:
+        1. If the last tool used was a write tool, it assumes progress and returns no repetitive tools.
+        2. It checks for any read tool that has been used 2 or more times in the history.
+        3. If no tools are repeated, but all tools in the history are read tools,
+           it flags all of them as potentially repetitive.
+
+        It avoids flagging repetition if a "write" tool was used recently,
+        as that suggests progress is being made.
+        """
+        history_len = len(self.tool_usage_history)
+
+        # Not enough history to detect a pattern
+        if history_len < 2:
+            return set()
+
+        # If the last tool was a write tool, we're likely making progress.
+        if isinstance(self.tool_usage_history[-1], str):
+            last_tool_lower = self.tool_usage_history[-1].lower()
+
+            if last_tool_lower in self.write_tools:
+                self.tool_usage_history = []
+                return set()
+
+        # If all tools in history are read tools, return all of them
+        if all(tool.lower() in self.read_tools for tool in self.tool_usage_history):
+            return set(tool for tool in self.tool_usage_history)
+
+        # Check for any read tool used more than once
+        tool_counts = Counter(tool for tool in self.tool_usage_history)
+        repetitive_tools = {
+            tool
+            for tool, count in tool_counts.items()
+            if count >= 2 and tool.lower() in self.read_tools
+        }
+
+        if repetitive_tools:
+            return repetitive_tools
+
+        return set()
+
+    def _generate_tool_context(self, repetitive_tools):
+        """
+        Generate a context message for the LLM about recent tool usage.
+        """
+        if not self.tool_usage_history:
+            return ""
+
+        context_parts = ['<context name="tool_usage_history">']
+
+        # Add turn and tool call statistics
+        context_parts.append("## Turn and Tool Call Statistics")
+        context_parts.append(f"- Current turn: {self.num_reflections + 1}")
+        context_parts.append(f"- Tool calls this turn: {self.tool_call_count}")
+        context_parts.append(f"- Total tool calls in session: {self.num_tool_calls}")
+        context_parts.append("\n\n")
+
+        # Add recent tool usage history
+        context_parts.append("## Recent Tool Usage History")
+        if len(self.tool_usage_history) > 10:
+            recent_history = self.tool_usage_history[-10:]
+            context_parts.append("(Showing last 10 tools)")
+        else:
+            recent_history = self.tool_usage_history
+
+        for i, tool in enumerate(recent_history, 1):
+            context_parts.append(f"{i}. {tool}")
+        context_parts.append("\n\n")
+
+        if repetitive_tools:
+            context_parts.append(
+                "**Instruction:**\nYou have used the following tool(s) repeatedly:"
+            )
+
+            context_parts.append("### DO NOT USE THE FOLLOWING TOOLS/FUNCTIONS")
+
+            for tool in repetitive_tools:
+                context_parts.append(f"- `{tool}`")
+            context_parts.append(
+                "Your exploration appears to be stuck in a loop. Please try a different approach:"
+            )
+            context_parts.append("\n")
+            context_parts.append("**Suggestions for alternative approaches:**")
+            context_parts.append(
+                "- If you've been searching for files, try working with the files already in"
+                " context"
+            )
+            context_parts.append(
+                "- If you've been viewing files, try making actual edits to move forward"
+            )
+            context_parts.append("- Consider using different tools that you haven't used recently")
+            context_parts.append(
+                "- Focus on making concrete progress rather than gathering more information"
+            )
+            context_parts.append(
+                "- Use the files you've already discovered to implement the requested changes"
+            )
+            context_parts.append("\n")
+            context_parts.append(
+                "You most likely have enough context for a subset of the necessary changes."
+            )
+            context_parts.append("Please prioritize file editing over further exploration.")
+
+        context_parts.append("</context>")
+        return "\n".join(context_parts)
+
+    async def _apply_edits_from_response(self):
         """
         Parses and applies SEARCH/REPLACE edits found in self.partial_response_content.
         Returns a set of relative file paths that were successfully edited.
@@ -2213,13 +1632,13 @@ class NavigatorCoder(Coder):
                     allowed = seen_paths[path]
                 else:
                     # Use the base Coder's permission check method
-                    allowed = self.allowed_to_edit(path)
+                    allowed = await self.allowed_to_edit(path)
                     seen_paths[path] = allowed
                 if allowed:
                     prepared_edits.append(edit)
 
             # Commit any dirty files identified by allowed_to_edit
-            self.dirty_commit()
+            await self.dirty_commit()
             self.need_commit_before_edits = set()  # Clear after commit
 
             # 3. Apply edits (logic adapted from EditBlockCoder.apply_edits)
@@ -2318,20 +1737,20 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                     lint_errors = self.lint_edited(edited_files)
                     self.auto_commit(edited_files, context="Ran the linter")
                     if lint_errors and not self.reflected_message:  # Reflect only if no edit errors
-                        ok = self.io.confirm_ask("Attempt to fix lint errors?")
+                        ok = await self.io.confirm_ask("Attempt to fix lint errors?")
                         if ok:
                             self.reflected_message = lint_errors
 
-                shared_output = self.run_shell_commands()
+                shared_output = await self.run_shell_commands()
                 if shared_output:
                     # Add shell output as a new user message? Or just display?
                     # Let's just display for now to avoid complex history manipulation
                     self.io.tool_output("Shell command output:\n" + shared_output)
 
                 if self.auto_test and not self.reflected_message:  # Reflect only if no prior errors
-                    test_errors = self.commands.cmd_test(self.test_cmd)
+                    test_errors = await self.commands.cmd_test(self.test_cmd)
                     if test_errors:
-                        ok = self.io.confirm_ask("Attempt to fix test errors?")
+                        ok = await self.io.confirm_ask("Attempt to fix test errors?")
                         if ok:
                             self.reflected_message = test_errors
 
@@ -2352,7 +1771,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
         except Exception as err:
             self.io.tool_error("Exception while applying edits:")
             self.io.tool_error(str(err), strip=False)
-            traceback.print_exc()
+            self.io.tool_error(traceback.format_exc())
             self.reflected_message = f"Exception while applying edits: {str(err)}"
 
         return edited_files
@@ -2363,7 +1782,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
 
         Parameters:
         - file_path: Path to the file to add
-        - explicit: Whether this was an explicit view command (vs. implicit through ViewFilesAtGlob/ViewFilesMatching)
+        - explicit: Whether this was an explicit view command (vs. implicit through ViewFilesMatching)
         """
         # Check if file exists
         abs_path = self.abs_root_path(file_path)
@@ -2433,28 +1852,28 @@ Just reply with fixed versions of the {blocks} above that failed to match.
         # Get new files to add (not already in context)
         mentioned_files - current_files
 
-        # In navigator mode, we *only* add files via explicit tool commands (`View`, `ViewFilesAtGlob`, etc.).
+        # In agent mode, we *only* add files via explicit tool commands (`View`, `ViewFilesAtGlob`, etc.).
         # Do nothing here for implicit mentions.
         pass
 
-    def check_for_file_mentions(self, content):
+    async def check_for_file_mentions(self, content):
         """
         Override parent's method to use our own file processing logic.
 
-        Override parent's method to disable implicit file mention handling in navigator mode.
+        Override parent's method to disable implicit file mention handling in agent mode.
         Files should only be added via explicit tool commands
         (`View`, `ViewFilesAtGlob`, `ViewFilesMatching`, `ViewFilesWithSymbol`).
         """
-        # Do nothing - disable implicit file adds in navigator mode.
+        # Do nothing - disable implicit file adds in agent mode.
         pass
 
-    def preproc_user_input(self, inp):
+    async def preproc_user_input(self, inp):
         """
         Override parent's method to wrap user input in a context block.
         This clearly delineates user input from other sections in the context window.
         """
         # First apply the parent's preprocessing
-        inp = super().preproc_user_input(inp)
+        inp = await super().preproc_user_input(inp)
 
         # If we still have input after preprocessing, wrap it in a context block
         if inp and not inp.startswith('<context name="user_input">'):
@@ -2496,7 +1915,7 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                         if line.startswith("??"):
                             # Extract the filename (remove the '?? ' prefix)
                             untracked_file = line[3:]
-                            if not self.repo.git_ignored_file(untracked_file):
+                            if not self.repo.ignored_file(untracked_file):
                                 untracked_files.append(untracked_file)
                 except Exception as e:
                     self.io.tool_warning(f"Error getting untracked files: {str(e)}")
@@ -2534,15 +1953,15 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                         current = current[part]
 
             # Function to recursively print the tree
-            def print_tree(node, prefix="- ", indent="  ", path=""):
+            def print_tree(node, prefix="- ", indent="  ", current_path=""):
                 lines = []
                 # First print all directories
                 dirs = sorted([k for k in node.keys() if k != "."])
                 for i, dir_name in enumerate(dirs):
-                    full_path = f"{path}/{dir_name}" if path else dir_name
-                    lines.append(f"{prefix}{full_path}/")
+                    # Only print the current directory name, not the full path
+                    lines.append(f"{prefix}{dir_name}/")
                     sub_lines = print_tree(
-                        node[dir_name], prefix=prefix, indent=indent, path=full_path
+                        node[dir_name], prefix=prefix, indent=indent, current_path=dir_name
                     )
                     for sub_line in sub_lines:
                         lines.append(f"{indent}{sub_line}")
@@ -2550,9 +1969,8 @@ Just reply with fixed versions of the {blocks} above that failed to match.
                 # Then print all files
                 if "." in node:
                     for file_name in sorted(node["."]):
-                        lines.append(
-                            f"{prefix}{path}/{file_name}" if path else f"{prefix}{file_name}"
-                        )
+                        # Only print the current file name, not the full path
+                        lines.append(f"{prefix}{file_name}")
 
                 return lines
 
@@ -2564,6 +1982,44 @@ Just reply with fixed versions of the {blocks} above that failed to match.
             return result
         except Exception as e:
             self.io.tool_error(f"Error generating directory structure: {str(e)}")
+            return None
+
+    def get_todo_list(self):
+        """
+        Generate a todo list context block from the .aider.todo.txt file.
+        Returns formatted string with the current todo list or None if empty/not present.
+        """
+
+        try:
+            # Define the todo file path
+            todo_file_path = ".aider.todo.txt"
+            abs_path = self.abs_root_path(todo_file_path)
+
+            # Check if file exists
+            import os
+
+            if not os.path.isfile(abs_path):
+                return (
+                    '<context name="todo_list">\n'
+                    "Todo list does not exist. Please update it with the `UpdataTodoList` tool."
+                    "</context>"
+                )
+
+            # Read todo list content
+            content = self.io.read_text(abs_path)
+            if content is None or not content.strip():
+                return None
+
+            # Format the todo list context block
+            result = '<context name="todo_list">\n'
+            result += "## Current Todo List\n\n"
+            result += "Below is the current todo list managed via the `UpdateTodoList` tool:\n\n"
+            result += f"```\n{content}\n```\n"
+            result += "</context>"
+
+            return result
+        except Exception as e:
+            self.io.tool_error(f"Error generating todo list context: {str(e)}")
             return None
 
     def get_git_status(self):

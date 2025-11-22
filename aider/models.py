@@ -1,3 +1,4 @@
+import asyncio
 import difflib
 import hashlib
 import importlib.resources
@@ -11,15 +12,15 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Optional, Union
 
-import json5
 import yaml
 from PIL import Image
 
 from aider import __version__
 from aider.dump import dump  # noqa: F401
+from aider.helpers.requests import model_request_parser
 from aider.llm import litellm
 from aider.openrouter import OpenRouterModelManager
-from aider.sendchat import ensure_alternating_roles, sanity_check_messages
+from aider.sendchat import sanity_check_messages
 from aider.utils import check_pip_install_extra
 
 RETRY_TIMEOUT = 60
@@ -97,7 +98,8 @@ MODEL_ALIASES = {
     "quasar": "openrouter/openrouter/quasar-alpha",
     "r1": "deepseek/deepseek-reasoner",
     "gemini-2.5-pro": "gemini/gemini-2.5-pro",
-    "gemini": "gemini/gemini-2.5-pro",
+    "gemini-3-pro-preview": "gemini/gemini-3-pro-preview",
+    "gemini": "gemini/gemini-3-pro-preview",
     "gemini-exp": "gemini/gemini-2.5-pro-exp-03-25",
     "grok3": "xai/grok-3-beta",
     "optimus": "openrouter/openrouter/optimus-alpha",
@@ -437,7 +439,7 @@ class Model(ModelSettings):
             return  # <--
 
         last_segment = model.split("/")[-1]
-        if last_segment in ("gpt-5", "gpt-5-2025-08-07"):
+        if last_segment in ("gpt-5", "gpt-5-2025-08-07") or "gpt-5.1" in model:
             self.use_temperature = False
             self.edit_format = "diff"
             if "reasoning_effort" not in self.accepts_settings:
@@ -893,23 +895,33 @@ class Model(ModelSettings):
                 return self.extra_params["extra_body"]["reasoning_effort"]
         return None
 
-    def is_deepseek_r1(self):
+    def is_deepseek(self):
         name = self.name.lower()
         if "deepseek" not in name:
             return
-        return "r1" in name or "reasoner" in name
+        return True
 
     def is_ollama(self):
         return self.name.startswith("ollama/") or self.name.startswith("ollama_chat/")
 
-    def send_completion(
+    async def send_completion(
         self, messages, functions, stream, temperature=None, tools=None, max_tokens=None
     ):
         if os.environ.get("AIDER_SANITY_CHECK_TURNS"):
             sanity_check_messages(messages)
 
-        if self.is_deepseek_r1():
-            messages = ensure_alternating_roles(messages)
+        messages = model_request_parser(self, messages)
+
+        if self.verbose:
+            for message in messages:
+                msg_role = message.get("role")
+                msg_content = message.get("content") if message.get("content") else ""
+                msg_trunc = ""
+
+                if message.get("content"):
+                    msg_trunc = message.get("content")[:30]
+
+                print(f"{msg_role} ({len(msg_content)}): {msg_trunc}")
 
         kwargs = dict(model=self.name, stream=stream)
 
@@ -923,26 +935,22 @@ class Model(ModelSettings):
             kwargs["temperature"] = temperature
 
         # `tools` is for modern tool usage. `functions` is for legacy/forced calls.
-        # If `tools` is provided, it's the canonical list. If not, use `functions`.
-        # This handles `base_coder` sending both with same content for `navigator_coder`.
-        effective_tools = tools if tools is not None else functions
+        # This handles `base_coder` sending both with same content for `agent_coder`.
+        effective_tools = tools
+
+        if effective_tools is None and functions:
+            # Convert legacy `functions` to `tools` format if `tools` isn't provided.
+            effective_tools = [dict(type="function", function=f) for f in functions]
 
         if effective_tools:
-            # Check if we have legacy format functions (which lack a 'type' key) and convert them.
-            # This is a simplifying assumption that works for aider's use cases.
-            is_legacy = any("type" not in tool for tool in effective_tools)
-            if is_legacy:
-                kwargs["tools"] = [dict(type="function", function=tool) for tool in effective_tools]
-            else:
-                kwargs["tools"] = effective_tools
+            kwargs["tools"] = effective_tools
 
         # Forcing a function call is for legacy style `functions` with a single function.
-        # This is used by ArchitectCoder and not intended for NavigatorCoder's tools.
+        # This is used by ArchitectCoder and not intended for AgentCoder's tools.
         if functions and len(functions) == 1:
             function = functions[0]
-            is_legacy = "type" not in function
 
-            if is_legacy and "name" in function:
+            if "name" in function:
                 tool_name = function.get("name")
                 if tool_name:
                     kwargs["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
@@ -978,21 +986,22 @@ class Model(ModelSettings):
                 }
 
         try:
-            res = litellm.completion(**kwargs)
+            res = await litellm.acompletion(**kwargs)
         except Exception as err:
-            res = "Model API Response Error. Please retry the previous request"
+            print(f"LiteLLM API Error: {str(err)}")
+            res = self.model_error_response()
 
             if self.verbose:
                 print(f"LiteLLM API Error: {str(err)}")
+                raise
 
         return hash_object, res
 
-    def simple_send_with_retries(self, messages, max_tokens=None):
+    async def simple_send_with_retries(self, messages, max_tokens=None):
         from aider.exceptions import LiteLLMExceptions
 
         litellm_ex = LiteLLMExceptions()
-        if "deepseek-reasoner" in self.name:
-            messages = ensure_alternating_roles(messages)
+        messages = model_request_parser(self, messages)
         retry_delay = 0.125
 
         if self.verbose:
@@ -1000,7 +1009,7 @@ class Model(ModelSettings):
 
         while True:
             try:
-                _hash, response = self.send_completion(
+                _hash, response = await self.send_completion(
                     messages=messages,
                     functions=None,
                     stream=False,
@@ -1030,6 +1039,22 @@ class Model(ModelSettings):
                 continue
             except AttributeError:
                 return None
+
+    async def model_error_response(self):
+        for i in range(1):
+            await asyncio.sleep(0.1)
+            yield litellm.ModelResponse(
+                choices=[
+                    litellm.Choices(
+                        finish_reason="stop",
+                        index=0,
+                        message=litellm.Message(
+                            content="Model API Response Error. Please retry the previous request"
+                        ),  # Provide an empty message object
+                    )
+                ],
+                model=self.name,
+            )
 
 
 def register_models(model_settings_fnames):
@@ -1069,7 +1094,7 @@ def register_litellm_models(model_fnames):
             data = Path(model_fname).read_text()
             if not data.strip():
                 continue
-            model_def = json5.loads(data)
+            model_def = json.loads(data)
             if not model_def:
                 continue
 
@@ -1093,12 +1118,12 @@ def validate_variables(vars):
     return dict(keys_in_environment=True, missing_keys=missing)
 
 
-def sanity_check_models(io, main_model):
-    problem_main = sanity_check_model(io, main_model)
+async def sanity_check_models(io, main_model):
+    problem_main = await sanity_check_model(io, main_model)
 
     problem_weak = None
     if main_model.weak_model and main_model.weak_model is not main_model:
-        problem_weak = sanity_check_model(io, main_model.weak_model)
+        problem_weak = await sanity_check_model(io, main_model.weak_model)
 
     problem_editor = None
     if (
@@ -1106,12 +1131,12 @@ def sanity_check_models(io, main_model):
         and main_model.editor_model is not main_model
         and main_model.editor_model is not main_model.weak_model
     ):
-        problem_editor = sanity_check_model(io, main_model.editor_model)
+        problem_editor = await sanity_check_model(io, main_model.editor_model)
 
     return problem_main or problem_weak or problem_editor
 
 
-def sanity_check_model(io, model):
+async def sanity_check_model(io, model):
     show = False
 
     if model.missing_keys:
@@ -1133,7 +1158,7 @@ def sanity_check_model(io, model):
         io.tool_warning(f"Warning for {model}: Unknown which environment variables are required.")
 
     # Check for model-specific dependencies
-    check_for_dependencies(io, model.name)
+    await check_for_dependencies(io, model.name)
 
     if not model.info:
         show = True
@@ -1150,7 +1175,7 @@ def sanity_check_model(io, model):
     return show
 
 
-def check_for_dependencies(io, model_name):
+async def check_for_dependencies(io, model_name):
     """
     Check for model-specific dependencies and install them if needed.
 
@@ -1160,13 +1185,13 @@ def check_for_dependencies(io, model_name):
     """
     # Check if this is a Bedrock model and ensure boto3 is installed
     if model_name.startswith("bedrock/"):
-        check_pip_install_extra(
+        await check_pip_install_extra(
             io, "boto3", "AWS Bedrock models require the boto3 package.", ["boto3"]
         )
 
     # Check if this is a Vertex AI model and ensure google-cloud-aiplatform is installed
     elif model_name.startswith("vertex_ai/"):
-        check_pip_install_extra(
+        await check_pip_install_extra(
             io,
             "google.cloud.aiplatform",
             "Google Vertex AI models require the google-cloud-aiplatform package.",

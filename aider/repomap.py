@@ -17,9 +17,13 @@ from pygments.token import Token
 from tqdm import tqdm
 
 from aider.dump import dump
+from aider.helpers.similarity import (
+    cosine_similarity,
+    create_bigram_vector,
+    normalize_vector,
+)
 from aider.special import filter_important_files
 from aider.tools.tool_utils import ToolError
-from aider.waiting import Spinner
 
 # tree_sitter is throwing a FutureWarning
 warnings.simplefilter("ignore", category=FutureWarning)
@@ -83,8 +87,12 @@ class RepoMap:
 
     warned_files = set()
 
+    # Class variable to store initial ranked tags results
+    _initial_ranked_tags = None
+    _initial_ident_to_files = None
+
     # Define kinds that typically represent definitions across languages
-    # Used by NavigatorCoder to filter tags for the symbol outline
+    # Used by AgentCoder to filter tags for the symbol outline
     definition_kinds = {
         "class",
         "struct",
@@ -179,6 +187,12 @@ class RepoMap:
         self.map_cache = {}
         self.map_processing_time = 0
         self.last_map = None
+
+        # Initialize cache for mentioned identifiers similarity
+        self._last_mentioned_idents = None
+        self._last_mentioned_idents_vector = None
+        self._has_last_mentioned_idents = False
+        self._mentioned_ident_similarity = 0.8
 
         if self.verbose:
             self.io.tool_output(
@@ -430,6 +444,27 @@ class RepoMap:
         return definition_tag.start_line, definition_tag.end_line
         # Check if the file is in the cache and if the modification time has not changed
 
+    def shared_path_components(self, path1_str, path2_str):
+        """
+        Calculates distance based on how many parent components are shared.
+        Distance = Total parts - (2 * Shared parts). Lower is closer.
+        """
+        p1 = Path(path1_str).parts
+        p2 = Path(path2_str).parts
+
+        # Count the number of common leading parts
+        common_count = 0
+        for comp1, comp2 in zip(p1, p2):
+            if comp1 == comp2:
+                common_count += 1
+            else:
+                break
+
+        # A simple metric of difference:
+        # (Total parts in P1 + Total parts in P2) - (2 * Common parts)
+        distance = len(p1) + len(p2) - (2 * common_count)
+        return distance
+
     def get_tags_raw(self, fname, rel_fname):
         lang = filename_to_lang(fname)
         if not lang:
@@ -530,7 +565,7 @@ class RepoMap:
             )
 
     def get_ranked_tags(
-        self, chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, progress=None
+        self, chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, progress=True
     ):
         import networkx as nx
 
@@ -568,7 +603,7 @@ class RepoMap:
             if self.verbose:
                 self.io.tool_output(f"Processing {fname}")
             if progress and not showing_bar:
-                progress(f"{UPDATING_REPO_MAP_MESSAGE}: {fname}")
+                self.io.update_spinner(f"{UPDATING_REPO_MAP_MESSAGE}: {fname}")
 
             try:
                 file_ok = Path(fname).is_file()
@@ -612,6 +647,7 @@ class RepoMap:
                 personalization[rel_fname] = current_pers  # Assign the final calculated value
 
             tags = list(self.get_tags(fname, rel_fname))
+
             if tags is None:
                 continue
 
@@ -643,11 +679,11 @@ class RepoMap:
             if ident in references:
                 continue
             for definer in defines[ident]:
-                G.add_edge(definer, definer, weight=0.1, ident=ident)
+                G.add_edge(definer, definer, weight=0.000001, ident=ident)
 
         for ident in idents:
             if progress:
-                progress(f"{UPDATING_REPO_MAP_MESSAGE}: {ident}")
+                self.io.update_spinner(f"{UPDATING_REPO_MAP_MESSAGE}: {ident}")
 
             definers = defines[ident]
 
@@ -657,28 +693,57 @@ class RepoMap:
             is_kebab = ("-" in ident) and any(c.isalpha() for c in ident)
             is_camel = any(c.isupper() for c in ident) and any(c.islower() for c in ident)
             if ident in mentioned_idents:
-                mul *= 10
-            if (is_snake or is_kebab or is_camel) and len(ident) >= 8:
-                mul *= 10
-            if ident.startswith("_"):
-                mul *= 0.1
-            if len(defines[ident]) > 5:
-                mul *= 0.1
+                mul *= 16
+
+            # Prioritize function-like identifiers
+            if (
+                (is_snake or is_kebab or is_camel)
+                and len(ident) >= 8
+                and "test" not in ident.lower()
+            ):
+                mul *= 16
+
+            # Downplay repetitive definitions in case of common boiler plate
+            # Scale down logarithmically given the increasing number of references in a codebase
+            # Ideally, this will help downweight boiler plate in frameworks, interfaces, and abstract classes
+            if len(defines[ident]) > 4:
+                exp = min(len(defines[ident]), 32)
+                mul *= math.log2((4 / (2**exp)) + 1)
+
+            # Calculate multiplier: log(number of unique file references * total references ^ 2)
+            # Used to balance the number of times an identifier appears with its number of refs per file
+            # Penetration in code base is important
+            # So is the frequency
+            # And the logarithm keeps them from scaling out of bounds forever
+            # Combined with the above downweighting
+            # There should be a push/pull that balances repetitiveness of identifier defs
+            # With absolute number of references throughout a codebase
+            unique_file_refs = len(set(references[ident]))
+            total_refs = len(references[ident])
+            ext_mul = round(math.log2(unique_file_refs * total_refs**2 + 1))
 
             for referencer, num_refs in Counter(references[ident]).items():
                 for definer in definers:
                     # dump(referencer, definer, num_refs, mul)
-                    # if referencer == definer:
-                    #    continue
 
-                    use_mul = mul
+                    # Only add edge if file extensions match
+                    referencer_ext = Path(referencer).suffix
+                    definer_ext = Path(definer).suffix
+                    if referencer_ext != definer_ext:
+                        continue
+
+                    use_mul = mul * ext_mul
+
                     if referencer in chat_rel_fnames:
-                        use_mul *= 50
+                        use_mul *= 64
+                    elif referencer == definer:
+                        use_mul *= 1 / 128
 
                     # scale down so high freq (low value) mentions don't dominate
-                    num_refs = math.sqrt(num_refs)
-
-                    G.add_edge(referencer, definer, weight=use_mul * num_refs, ident=ident)
+                    # num_refs = math.sqrt(num_refs)
+                    path_distance = self.shared_path_components(referencer, definer)
+                    weight = num_refs * use_mul * 2 ** (-1 * path_distance)
+                    G.add_edge(referencer, definer, weight=weight, ident=ident)
 
         if not references:
             pass
@@ -701,7 +766,7 @@ class RepoMap:
         ranked_definitions = defaultdict(float)
         for src in G.nodes:
             if progress:
-                progress(f"{UPDATING_REPO_MAP_MESSAGE}: {src}")
+                self.io.update_spinner(f"{UPDATING_REPO_MAP_MESSAGE}: {src}")
 
             src_rank = ranked[src]
             total_weight = sum(data["weight"] for _src, _dst, data in G.out_edges(src, data=True))
@@ -717,6 +782,10 @@ class RepoMap:
         )
 
         # dump(ranked_definitions)
+        # with open('defs.txt', 'w') as out_file:
+        #     import pprint
+        #     printer = pprint.PrettyPrinter(indent=2, stream=out_file)
+        #     printer.pprint(ranked_definitions)
 
         for (fname, ident), rank in ranked_definitions:
             # print(f"{rank:.03f} {fname} {ident}")
@@ -749,19 +818,33 @@ class RepoMap:
         mentioned_idents=None,
         force_refresh=False,
     ):
+        if not other_fnames:
+            other_fnames = list()
+        if not max_map_tokens:
+            max_map_tokens = self.max_map_tokens
+        if not mentioned_fnames:
+            mentioned_fnames = set()
+        if not mentioned_idents:
+            mentioned_idents = set()
+
         # Create a cache key
         cache_key = [
             tuple(sorted(chat_fnames)) if chat_fnames else None,
-            tuple(sorted(other_fnames)) if other_fnames else None,
+            len(other_fnames) if other_fnames else None,
             max_map_tokens,
         ]
 
         if self.refresh == "auto":
+            # Handle mentioned_fnames normally
             cache_key += [
                 tuple(sorted(mentioned_fnames)) if mentioned_fnames else None,
-                tuple(sorted(mentioned_idents)) if mentioned_idents else None,
             ]
-        cache_key = tuple(cache_key)
+
+            # Handle mentioned_idents with similarity check
+            cache_key_component = self._get_mentioned_idents_cache_component(mentioned_idents)
+            cache_key.append(cache_key_component)
+
+        cache_key = hash(str(tuple(cache_key)))
 
         use_cache = False
         if not force_refresh:
@@ -810,14 +893,10 @@ class RepoMap:
         if not mentioned_idents:
             mentioned_idents = set()
 
-        spin = Spinner(UPDATING_REPO_MAP_MESSAGE)
+        self.io.update_spinner(UPDATING_REPO_MAP_MESSAGE)
 
         ranked_tags = self.get_ranked_tags(
-            chat_fnames,
-            other_fnames,
-            mentioned_fnames,
-            mentioned_idents,
-            progress=spin.step,
+            chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, True
         )
 
         other_rel_fnames = sorted(set(self.get_rel_fname(fname) for fname in other_fnames))
@@ -827,8 +906,6 @@ class RepoMap:
         special_fnames = [(fn,) for fn in special_fnames]
 
         ranked_tags = special_fnames + ranked_tags
-
-        spin.step()
 
         num_tags = len(ranked_tags)
         lower_bound = 0
@@ -848,7 +925,8 @@ class RepoMap:
                 show_tokens = f"{middle / 1000.0:.1f}K"
             else:
                 show_tokens = str(middle)
-            spin.step(f"{UPDATING_REPO_MAP_MESSAGE}: {show_tokens} tokens")
+
+            self.io.update_spinner(f"{UPDATING_REPO_MAP_MESSAGE}: {show_tokens} tokens")
 
             tree = self.to_tree(ranked_tags[:middle], chat_rel_fnames)
             num_tokens = self.token_count(tree)
@@ -869,7 +947,6 @@ class RepoMap:
 
             middle = int((lower_bound + upper_bound) // 2)
 
-        spin.end()
         return best_tree
 
     tree_cache = dict()
@@ -951,6 +1028,70 @@ class RepoMap:
                 lois.append(tag.line)
 
         return output
+
+    def _get_mentioned_idents_cache_component(self, mentioned_idents):
+        """
+        Determine the cache key component for mentioned_idents using similarity comparison.
+
+        This method compares the current mentioned_idents with the previous ones using
+        cosine similarity. If the similarity is high enough, it returns the previous
+        cache key component to maintain cache hits. Otherwise, it updates the stored
+        values and returns the current mentioned_idents.
+
+        Args:
+            mentioned_idents (set): Current set of mentioned identifiers
+
+        Returns:
+            tuple or None: Cache key component for mentioned_idents
+        """
+        if not mentioned_idents:
+            self._last_mentioned_idents = None
+            self._last_mentioned_idents_vector = None
+            self._has_last_mentioned_idents = False
+            return None
+
+        current_mentioned_idents = tuple(mentioned_idents)
+
+        # Check if we have a previous cached value to compare against
+        if self._has_last_mentioned_idents:
+            # Create vector for current mentioned_idents
+            current_vector = create_bigram_vector(current_mentioned_idents)
+            current_vector_norm = normalize_vector(current_vector)
+
+            # Calculate cosine similarity
+            similarity = cosine_similarity(self._last_mentioned_idents_vector, current_vector_norm)
+            # If similarity is high enough, use the previous cache key component
+            if similarity >= self._mentioned_ident_similarity:
+                # Use the previous mentioned_idents for cache key to maintain cache hit
+                cache_key_component = self._last_mentioned_idents
+
+                # Make similarity more strict the more consecutive cache hits
+                self._mentioned_ident_similarity = min(
+                    0.9, self._mentioned_ident_similarity + 0.025
+                )
+            else:
+                # Similarity is too low, use current mentioned_idents
+                cache_key_component = current_mentioned_idents
+
+                # Update stored values
+                self._last_mentioned_idents = current_mentioned_idents
+                self._last_mentioned_idents_vector = current_vector_norm
+
+                # Make similarity less strict the more consecutive cache misses
+                self._mentioned_ident_similarity = max(
+                    0.5, self._mentioned_ident_similarity - 0.025
+                )
+        else:
+            # First time or no previous value, use current mentioned_idents
+            cache_key_component = current_mentioned_idents
+            current_vector = create_bigram_vector(current_mentioned_idents)
+
+            # Store for future comparisons
+            self._last_mentioned_idents = current_mentioned_idents
+            self._last_mentioned_idents_vector = normalize_vector(current_vector)
+
+        self._has_last_mentioned_idents = True
+        return cache_key_component
 
 
 def truncate_long_lines(text, max_length):

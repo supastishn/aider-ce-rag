@@ -1,8 +1,29 @@
 # Import necessary functions
 from aider.run_cmd import run_cmd_subprocess
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "Command",
+        "description": "Execute a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command_string": {
+                    "type": "string",
+                    "description": "The shell command to execute.",
+                },
+            },
+            "required": ["command_string"],
+        },
+    },
+}
 
-def _execute_command(coder, command_string):
+# Normalized tool name for lookup
+NORM_NAME = "command"
+
+
+async def _execute_command(coder, command_string):
     """
     Execute a non-interactive shell command after user confirmation.
     """
@@ -10,11 +31,17 @@ def _execute_command(coder, command_string):
         # Ask for confirmation before executing.
         # allow_never=True enables the 'Always' option.
         # confirm_ask handles remembering the 'Always' choice based on the subject.
-        confirmed = coder.io.confirm_ask(
-            "Allow execution of this command?",
-            subject=command_string,
-            explicit_yes_required=True,  # Require explicit 'yes' or 'always'
-            allow_never=True,  # Enable the 'Always' option
+
+        confirmed = (
+            True
+            if coder.skip_cli_confirmations
+            else await coder.io.confirm_ask(
+                "Allow execution of this command?",
+                subject=command_string,
+                explicit_yes_required=True,  # Require explicit 'yes' or 'always'
+                allow_never=True,  # Enable the 'Always' option
+                group_response="Command Tool",
+            )
         )
 
         if not confirmed:
@@ -56,3 +83,21 @@ def _execute_command(coder, command_string):
         # if coder.verbose:
         #     coder.io.tool_error(traceback.format_exc())
         return f"Error executing command: {str(e)}"
+
+
+async def process_response(coder, params):
+    """
+    Process the Command tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    command_string = params.get("command_string")
+    if command_string is not None:
+        return await _execute_command(coder, command_string)
+    else:
+        return "Error: Missing 'command_string' parameter for Command"

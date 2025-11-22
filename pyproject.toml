@@ -22,7 +22,6 @@ dynamic = ["dependencies", "optional-dependencies", "version"]
 Homepage = "https://github.com/dwash96/aider-ce"
 
 [project.scripts]
-aider = "aider.main:main"
 aider-ce = "aider.main:main"
 
 [tool.setuptools.dynamic]
@@ -41,7 +40,7 @@ voice = { file = "requirements/requirements-voice.in" }
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["aider"]
+include = ["aider*"]
 
 [build-system]
 requires = ["setuptools>=68", "setuptools_scm[toml]>=8"]

@@ -1,6 +1,28 @@
 import os
 import traceback
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "ReplaceLine",
+        "description": "Replace a single line in a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "line_number": {"type": "integer"},
+                "new_content": {"type": "string"},
+                "change_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["file_path", "line_number", "new_content"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "replaceline"
+
 
 def _execute_replace_line(
     coder, file_path, line_number, new_content, change_id=None, dry_run=False
@@ -112,7 +134,7 @@ def _execute_replace_line(
             coder.io.tool_error(f"Error tracking change for ReplaceLine: {track_e}")
             change_id = "TRACKING_FAILED"
 
-        coder.aider_edited_files.add(rel_path)
+        coder.files_edited_by_tools.add(rel_path)
 
         # Improve feedback
         coder.io.tool_output(
@@ -123,3 +145,29 @@ def _execute_replace_line(
     except Exception as e:
         coder.io.tool_error(f"Error in ReplaceLine: {str(e)}\n{traceback.format_exc()}")
         return f"Error: {str(e)}"
+
+
+def process_response(coder, params):
+    """
+    Process the ReplaceLine tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    line_number = params.get("line_number")
+    new_content = params.get("new_content")
+    change_id = params.get("change_id")
+    dry_run = params.get("dry_run", False)
+
+    if file_path is not None and line_number is not None and new_content is not None:
+        return _execute_replace_line(coder, file_path, line_number, new_content, change_id, dry_run)
+    else:
+        return (
+            "Error: Missing required parameters for ReplaceLine (file_path,"
+            " line_number, new_content)"
+        )

@@ -7,6 +7,28 @@ from .tool_utils import (
     validate_file_for_edit,
 )
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "ReplaceAll",
+        "description": "Replace all occurrences of text in a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "find_text": {"type": "string"},
+                "replace_text": {"type": "string"},
+                "change_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["file_path", "find_text", "replace_text"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "replaceall"
+
 
 def _execute_replace_all(coder, file_path, find_text, replace_text, change_id=None, dry_run=False):
     """
@@ -63,6 +85,8 @@ def _execute_replace_all(coder, file_path, find_text, replace_text, change_id=No
             change_id,
         )
 
+        coder.files_edited_by_tools.add(rel_path)
+
         # 7. Format and return result
         success_message = f"Replaced {count} occurrences in {file_path}"
         return format_tool_result(
@@ -75,3 +99,28 @@ def _execute_replace_all(coder, file_path, find_text, replace_text, change_id=No
     except Exception as e:
         # Handle unexpected errors
         return handle_tool_error(coder, tool_name, e)
+
+
+def process_response(coder, params):
+    """
+    Process the ReplaceAll tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    find_text = params.get("find_text")
+    replace_text = params.get("replace_text")
+    change_id = params.get("change_id")
+    dry_run = params.get("dry_run", False)
+
+    if file_path is not None and find_text is not None and replace_text is not None:
+        return _execute_replace_all(coder, file_path, find_text, replace_text, change_id, dry_run)
+    else:
+        return (
+            "Error: Missing required parameters for ReplaceAll (file_path, find_text, replace_text)"
+        )

@@ -18,13 +18,13 @@ warnings.simplefilter("ignore", category=FutureWarning)
 # It follows similar llama_index patterns as used here for the help docs.
 
 
-def install_help_extra(io):
+async def install_help_extra(io):
     pip_install_cmd = [
         "aider-ce[help]",
         "--extra-index-url",
         "https://download.pytorch.org/whl/cpu",
     ]
-    res = utils.check_pip_install_extra(
+    res = await utils.check_pip_install_extra(
         io,
         "llama_index.embeddings.huggingface",
         "To use interactive /help you need to install the help extras",

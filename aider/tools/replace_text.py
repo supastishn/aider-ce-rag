@@ -7,6 +7,30 @@ from .tool_utils import (
     validate_file_for_edit,
 )
 
+schema = {
+    "type": "function",
+    "function": {
+        "name": "ReplaceText",
+        "description": "Replace text in a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "find_text": {"type": "string"},
+                "replace_text": {"type": "string"},
+                "near_context": {"type": "string"},
+                "occurrence": {"type": "integer", "default": 1},
+                "change_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["file_path", "find_text", "replace_text"],
+        },
+    },
+}
+
+# Normalized tool name for lookup
+NORM_NAME = "replacetext"
+
 
 def _execute_replace_text(
     coder,
@@ -111,6 +135,7 @@ def _execute_replace_text(
             change_id,
         )
 
+        coder.files_edited_by_tools.add(rel_path)
         # 8. Format and return result
         success_message = f"Replaced {occurrence_str} in {file_path}"
         return format_tool_result(
@@ -123,3 +148,40 @@ def _execute_replace_text(
     except Exception as e:
         # Handle unexpected errors
         return handle_tool_error(coder, tool_name, e)
+
+
+def process_response(coder, params):
+    """
+    Process the ReplaceText tool response.
+
+    Args:
+        coder: The Coder instance
+        params: Dictionary of parameters
+
+    Returns:
+        str: Result message
+    """
+    file_path = params.get("file_path")
+    find_text = params.get("find_text")
+    replace_text = params.get("replace_text")
+    near_context = params.get("near_context")
+    occurrence = params.get("occurrence", 1)
+    change_id = params.get("change_id")
+    dry_run = params.get("dry_run", False)
+
+    if file_path is not None and find_text is not None and replace_text is not None:
+        return _execute_replace_text(
+            coder,
+            file_path,
+            find_text,
+            replace_text,
+            near_context,
+            occurrence,
+            change_id,
+            dry_run,
+        )
+    else:
+        return (
+            "Error: Missing required parameters for ReplaceText (file_path,"
+            " find_text, replace_text)"
+        )
